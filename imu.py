@@ -18,6 +18,7 @@ NOTE: if wheaney's xr-driver systemd service is installed it owns the device.
 """
 
 import math
+import os
 import struct
 import sys
 import threading
@@ -25,8 +26,10 @@ import time
 
 try:
     import hid
-except ImportError:
-    sys.exit("missing dependency: sudo pacman -S python-hidapi")
+except ImportError as e:
+    raise ImportError(
+        "missing dependency: run ./install.sh or: sudo pacman -S python-hidapi"
+    ) from e
 
 VID = 0x3318
 PKT = 0x40
@@ -69,6 +72,54 @@ def build_enable(checksum_span: str) -> bytes:
     span = bytes(pkt[5:PKT]) if checksum_span == "padded" else bytes(pkt[5:9])
     struct.pack_into("<I", pkt, 1, adler32(span))
     return bytes(pkt)
+
+
+def _connect(path):
+    """Open an HID device with whichever 'hid' binding is installed
+    (python-hidapi: C ext, hid.device / open_path; python-hid: pure ctypes,
+    hid.Device(path=...)). Returns (dev, read_fn); read_fn(n, timeout_ms)
+    yields a packet (bytes/list) or None."""
+    p_str = path.decode() if isinstance(path, (bytes, bytearray)) else path
+    p_bytes = os.fsencode(p_str)
+    if hasattr(hid, "device"):
+        dev = hid.device()
+        try:
+            dev.open_path(p_bytes)
+        except TypeError:
+            dev.open_path(p_str)
+        if hasattr(dev, "set_nonblocking"):
+            try:
+                dev.set_nonblocking(0)
+            except Exception:
+                pass
+
+        def rd(n, timeout_ms):
+            try:
+                return dev.read(n, timeout_ms=timeout_ms)
+            except TypeError:
+                try:
+                    return dev.read(n, timeout_ms)
+                except TypeError:  # no timeout support: poll
+                    end = time.monotonic() + timeout_ms / 1000.0
+                    while time.monotonic() < end:
+                        pkt = dev.read(n)
+                        if pkt:
+                            return pkt
+                        time.sleep(0.004)
+                    return None
+        return dev, rd
+
+    dev = hid.Device(path=p_str)
+
+    def rd(n, timeout_ms):
+        for args, kwargs in (((n, timeout_ms), {}), ((n,), {"timeout": timeout_ms}),
+                             ((n,), {})):
+            try:
+                return dev.read(*args, **kwargs)
+            except TypeError:
+                continue
+        return None
+    return dev, rd
 
 
 def _s24(b: bytes) -> int:
@@ -220,26 +271,30 @@ class ImuReader(threading.Thread):
 
     # -- device discovery ------------------------------------------------
     def _candidates(self):
-        devs = hid.enumerate(VID, 0)
+        try:
+            devs = hid.enumerate(VID, 0)
+        except TypeError:  # python-hid has a different enumerate signature
+            devs = [d for d in hid.enumerate() if d.get("vendor_id") == VID]
         # IMU interface is 3 on the original Air; other models differ, so
         # probe interface-3 first, then everything else as fallback.
         devs.sort(key=lambda d: 0 if d.get("interface_number") == 3 else 1)
-        return [d["path"] for d in devs]
+        return [d["path"] for d in devs if d.get("path")]
 
     def _try_open(self, path):
         for span in ("padded", "minimal"):
+            dev = None
             try:
-                dev = hid.device()
-                dev.open_path(path)
-                dev.set_nonblocking(0)
+                dev, rd = _connect(path)
                 dev.write(build_enable(span))
-                pkt = dev.read(PKT, timeout_ms=300)
+                pkt = rd(PKT, 300)
                 if pkt and decode(bytes(pkt)):
+                    self._rd = rd
                     return dev, span
                 dev.close()
             except Exception:
                 try:
-                    dev.close()
+                    if dev:
+                        dev.close()
                 except Exception:
                     pass
         return None, None
@@ -273,7 +328,7 @@ class ImuReader(threading.Thread):
         count = 0
         while not self._stop.is_set():
             try:
-                pkt = self.dev.read(PKT, timeout_ms=100)
+                pkt = self._rd(PKT, 100)
             except Exception as e:
                 print(f"[imu] read error: {e}", flush=True)
                 time.sleep(0.5)
