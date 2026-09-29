@@ -1,4 +1,4 @@
-# deck-hud — Iron-Man HUD for Xreal Air on Steam Deck (CachyOS)
+# XRHUD — Useful HUD for Xreal Air on Steam Deck (Built for CachyOS)
 
 Deck-side of the HUD: reads the glasses' IMU over USB, fuses attitude with a
 Madgwick filter, and renders a fighter-jet HUD (pitch ladder + bank arc,
