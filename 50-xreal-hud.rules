@@ -1,0 +1,3 @@
+# Xreal Air - grant the logged-in user access to the HID interfaces
+# (IMU + MCU). VID 3318 per the XR Linux driver's udev rules.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", MODE="0660", TAG+="uaccess"
