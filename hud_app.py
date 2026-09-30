@@ -172,7 +172,7 @@ class Hud:
         self.gps = GpsListener(gps_port)
         self.gps.start()
         self.imu = None if demo else ImuManager()
-        self.menu = True                  # visible at start so controls are discoverable
+        self.menu = False                  # visible at start so controls are discoverable
         self.unit = self._load_unit()
         self.smooth = {"pitch": 0.0, "bank": 0.0}
         self.clock = pygame.time.Clock()
@@ -274,8 +274,9 @@ class Hud:
         lw2 = max(3, int(2.4 * k))
         boldlw = max(2, int(1.2 * k))
 
-        pitch, bank = imu["pitch"], imu["bank"]
-        self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * 0.15
+        pitch, bank = imu["bank"], imu["pitch"]
+
+        self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * 0.6
         self.smooth["bank"] += (bank - self.smooth["bank"]) * 0.6
         sp, sb = self.smooth["pitch"], self.smooth["bank"]
 
