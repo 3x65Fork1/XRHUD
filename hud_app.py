@@ -279,6 +279,14 @@ class Hud:
 
         pitch, bank = imu["bank"], imu["pitch"]
 
+        print(
+            f"RAW pitch={imu['pitch']:+8.2f} "
+            f"bank={imu['bank']:+8.2f} "
+            f"mapped pitch={pitch:+8.2f} "
+            f"bank={bank:+8.2f}",
+            flush=True,
+        )
+
         self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * 0.6
         self.smooth["bank"] += (bank - self.smooth["bank"]) * 0.6
         sp, sb = self.smooth["pitch"], self.smooth["bank"]
