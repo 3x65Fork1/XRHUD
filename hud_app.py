@@ -242,8 +242,8 @@ class Hud:
     def imu_state(self, t):
         if self.demo:
             return {"ok": True, "hz": 60.0,
-                    "bank": math.sin(t / 2.1) * 9.0,
-                    "pitch": math.sin(t / 1.3) * 22.0,
+                    "pitch": math.sin(t / 2.1) * 9.0,
+                    "bank": math.sin(t / 1.3) * 22.0,
                     "yaw": math.sin(t / 3.7) * 40.0,
                     "g": 1.0 + math.sin(t / 0.9) * 0.12}
         return self.imu.state
@@ -332,8 +332,10 @@ class Hud:
 
         # bottom center readouts
         yaw = ((imu.get("yaw", 0) % 360) + 360) % 360
-        mid = ("pitch %+d° · bank %+d° · %.2f g · hdg %03d°" %
-               (round(sp), round(sb), imu.get("g", 1.0), round(yaw)))
+        mid = ("P %+d B %+d Y %+d" %
+       (round(imu.get("pitch", 0)),
+        round(imu.get("bank", 0)),
+        round(imu.get("yaw", 0))))
         self.text(s, mid, DIM, CX, VH - 18, 12, False, "ca")
 
         # menu button (top left)
