@@ -214,24 +214,19 @@ class Madgwick:
     def _integrate(self, gx, gy, gz, dt):
         q0, q1, q2, q3 = self.q
 
-        dq0 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
-        dq1 = 0.5 * ( q0 * gx + q2 * gz - q3 * gy)
-        dq2 = 0.5 * ( q0 * gy - q1 * gz + q3 * gx)
-        dq3 = 0.5 * ( q0 * gz + q1 * gy - q2 * gx)
+        q0 += dt * 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
+        q1 += dt * 0.5 * (q0 * gx + q2 * gz - q3 * gy)
+        q2 += dt * 0.5 * (q0 * gy - q1 * gz + q3 * gx)
+        q3 += dt * 0.5 * (q0 * gz + q1 * gy - q2 * gx)
 
-        q0 += dt * dq0
-        q1 += dt * dq1
-        q2 += dt * dq2
-        q3 += dt * dq3
+        n = math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3) or 1.0
 
-        n = math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
-        if n > 1e-12:
-            self.q = [
-                q0 / n,
-                q1 / n,
-                q2 / n,
-                q3 / n,
-            ]
+        self.q = [
+            q0 / n,
+            q1 / n,
+            q2 / n,
+            q3 / n,
+        ]
 
 
 def euler_deg(q):
