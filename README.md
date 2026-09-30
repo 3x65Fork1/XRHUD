@@ -1,4 +1,4 @@
-# XRHUD — Useful HUD for Xreal Air on Steam Deck (Built for CachyOS)
+# deck-hud — Iron-Man HUD for Xreal Air on Steam Deck (CachyOS)
 
 Deck-side of the HUD: reads the glasses' IMU over USB, fuses attitude with a
 Madgwick filter, and renders a fighter-jet HUD (pitch ladder + bank arc,
@@ -53,11 +53,10 @@ device: `sudo systemctl stop xr-driver`.
 - **GPS tile** stays in "awaiting phone link" until the GrapheneOS streamer
   (next phase) pushes JSON to UDP `8676`. Speed arrives in m/s; the HUD
   converts to mph/kmh.
-- **Checksum span:** the enable-stream packet is built two ways (`padded` /
-  `minimal`); `imu.py` tries both at connect and keeps whichever produces
-  packets. If neither works on newer firmware, `python3 imu.py --dump` and
-  compare against the community driver (github.com/wheaney/XRLinuxDriver,
-  modules xrealAirDeviceKit + xrealInterfaceLibrary).
+- **Protocol source:** the packet codec mirrors the reference C driver
+  (thejackimonster's xreal-imu, vendored in DannyDesert/XReal-Ultrawide):
+  standard CRC32 framing, full init handshake, magnetometer decoded but
+  unused (it degrades fusion on this hardware).
 - **CPU:** fusion runs at whatever rate the glasses stream (up to ~1 kHz) and
   costs a few percent of one core; the browser gets 60 Hz updates.
 - **Black background:** on the Air's optical see-through panels, black pixels
@@ -76,8 +75,10 @@ Install once (no pip, no venv, no PyInstaller):
 ./install.sh
 ```
 
-What it does: `pacman -S python-pygame python-hidapi hidapi` (all in the
-CachyOS repos), copies the app to `~/.local/share/xreal-hud/`, creates the
+What it does: makes sure `python-pygame` is installed and that SOME `hid`
+binding is importable (Arch ships two conflicting ones - `python-hidapi` and
+`python-hid` - either works, and it will not force one if the other is
+present), copies the app to `~/.local/share/xreal-hud/`, creates the
 `xreal-hud` launcher Steam runs, and installs the udev rule. Re-run it any
 time after pulling changes.
 
