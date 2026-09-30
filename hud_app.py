@@ -242,8 +242,8 @@ class Hud:
     def imu_state(self, t):
         if self.demo:
             return {"ok": True, "hz": 60.0,
-                    "pitch": math.sin(t / 2.1) * 9.0,
-                    "bank": math.sin(t / 1.3) * 22.0,
+                    "bank": math.sin(t / 2.1) * 9.0,
+                    "pitch": math.sin(t / 1.3) * 22.0,
                     "yaw": math.sin(t / 3.7) * 40.0,
                     "g": 1.0 + math.sin(t / 0.9) * 0.12}
         return self.imu.state
