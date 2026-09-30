@@ -114,7 +114,7 @@ LADDER_DEGS = [-30, -20, -10, 0, 10, 20, 30]
 def xf(x, y, pitch, bank):
     """pitch/bank (deg) -> screen transform for world-fixed ladder lines."""
     y += pitch * 3.0
-    a = math.radians(-bank)
+    a = math.radians(bank)
     dx, dy = x - CX, y - CY
     return (CX + dx * math.cos(a) - dy * math.sin(a),
             CY + dx * math.sin(a) + dy * math.cos(a))
