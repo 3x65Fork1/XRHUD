@@ -118,7 +118,7 @@ def xf(x, y, pitch, bank):
     hud_pitch = bank
     hud_bank = pitch
 
-    y += hud_pitch * 3.0
+    y += hud_pitch * 0.6
     a = math.radians(hud_bank)
 
     dx, dy = x - CX, y - CY
