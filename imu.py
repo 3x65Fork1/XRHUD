@@ -2,18 +2,24 @@
 """
 Xreal Air IMU reader + Madgwick fusion.
 
-Protocol reference (reverse-engineered, confirmed against the community driver
-and the voidcomputing writeups):
-  - USB vendor 0x3318, IMU stream lives on a 0x40-byte HID interface
-    (interface 3 on the original Air; Air 2/Ultra may differ, so we probe).
-  - Enable stream:  0xaa-headered command packet, cmd 0x19, data 0x01.
-  - IMU event:      64-byte packet, header 0x01 0x02, fields per SPEC below.
+Protocol implemented from the reference C driver (thejackimonster's
+xreal-imu, vendored by DannyDesert/XReal-Ultrawide), which is derived from
+wheaney's XRLinuxDriver:
 
-If the glasses' enable packet layout ever changes, run with --dump and compare
-against: https://github.com/wheaney/XRLinuxDriver (modules/xrealAirDeviceKit,
-modules/xrealInterfaceLibrary) and voidcomputing's "worse-better-prettier" post.
+  - USB vendor 0x3318; products 0x0424 (Air), 0x0428 (Air 2), 0x0432 (Air 2
+    Pro), 0x0426 (Air 2 Ultra). IMU HID interface: 3 (2 on Ultra).
+  - Framed messages: [0xAA][crc32 u32le][len u16le][msgid u8][data...]
+    len = 3 + len(data); crc32 (standard, reflected) covers len..end-of-data.
+    Sent exactly as 8+len bytes via hid write - no padding, no report prefix.
+  - Msgids: 0x14 cal length, 0x15 cal segment, 0x19 stream on/off, 0x1A id.
+  - Init handshake: stop stream -> drain -> static id -> cal length ->
+    drain cal segments -> start stream.
+  - IMU event: 64-byte packet, signature 0x01 0x02, fields per SPEC below.
+  - gyro = raw * mult / div in deg/s; accel same; magnetometer mult/div are
+    big-endian and its s16 readings carry an inverted sign bit - the
+    reference driver found fusion works BETTER without mag, so it is unused.
 
-NOTE: if wheaney's xr-driver systemd service is installed it owns the device.
+NOTE: if wheaney's xr-driver systemd service is installed it owns the device:
   sudo systemctl stop xr-driver   # before running this
 """
 
@@ -23,56 +29,145 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 try:
     import hid
-except ImportError as e:
-    raise ImportError(
-        "missing dependency: run ./install.sh or: sudo pacman -S python-hidapi"
-    ) from e
+except ImportError:
+    sys.exit("missing dependency: sudo pacman -S python-hidapi (or python-hid)")
 
 VID = 0x3318
+KNOWN_PIDS = {0x0424: 3, 0x0428: 3, 0x0432: 3, 0x0426: 2}  # pid -> imu interface
 PKT = 0x40
+
+MSG_CAL_LENGTH = 0x14
+MSG_CAL_SEGMENT = 0x15
+MSG_STREAM = 0x19
+MSG_STATIC_ID = 0x1A
 
 # ---------------------------------------------------------------- packet codec
 
-def adler32(data: bytes, seed: int = 1) -> int:
-    """The glasses use an Adler-style checksum (mod 65521), seeded at 1."""
-    MOD = 65521
-    a = seed & 0xFFFF
-    b = (seed >> 16) & 0xFFFF
-    for x in data:
-        a = (a + x) % MOD
-        b = (b + a) % MOD
-    return (b << 16) | a
+def build_msg(msgid: int, data: bytes = b"") -> bytes:
+    """Frame a command message exactly as the reference driver does."""
+    body = struct.pack("<HB", 3 + len(data), msgid) + data
+    return b"\xAA" + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF) + body
 
 
-def build_disable() -> bytes:
-    pkt = bytearray(PKT)
-    pkt[0] = 0xAA
-    struct.pack_into("<H", pkt, 5, 1)
-    pkt[7] = 0x19
-    pkt[8] = 0x00                      # 0 = disable
-    struct.pack_into("<I", pkt, 1, adler32(bytes(pkt[5:PKT])))
-    return bytes(pkt)
+def _recv_msg(rd, msgid: int, want_len: int, timeout_ms: int):
+    """Read framed response packets until one matches msgid. -> data or None."""
+    end = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < end:
+        pkt = rd(PKT, 100)
+        if not pkt:
+            continue
+        pkt = bytes(pkt)
+        if len(pkt) >= 8 and pkt[0] == 0xAA and pkt[7] == msgid:
+            return pkt[8:8 + want_len]
+    return None
 
 
-def build_enable(checksum_span: str) -> bytes:
-    """Build the 'enable IMU stream' command packet.
+def _s24(b: bytes) -> int:
+    """3-byte little-endian signed integer (two's complement)."""
+    v = b[0] | (b[1] << 8) | (b[2] << 16)
+    return v - (1 << 24) if v & 0x800000 else v
 
-    checksum_span: 'padded'  -> checksum over bytes 5..64 (zero-padded packet)
-                   'minimal' -> checksum over bytes 5..9  (length+cmd+data only)
-    Both are tried at connect time; whichever produces IMU packets wins.
-    """
-    pkt = bytearray(PKT)
-    pkt[0] = 0xAA                      # command header
-    struct.pack_into("<H", pkt, 5, 1)  # additional-data length = 1 byte
-    pkt[7] = 0x19                      # command: enable IMU stream
-    pkt[8] = 0x01                      # 1 = enable, 0 = disable
-    span = bytes(pkt[5:PKT]) if checksum_span == "padded" else bytes(pkt[5:9])
-    struct.pack_into("<I", pkt, 1, adler32(span))
-    return bytes(pkt)
 
+def _mag_s16(b0: int, b1: int) -> int:
+    """Magnetometer reading: sign bit inverted (per reference driver)."""
+    v = b0 | ((b1 ^ 0x80) << 8)
+    return v - (1 << 16) if v & 0x8000 else v
+
+
+def decode(pkt: bytes):
+    """Parse one 64-byte IMU event packet -> dict, or None if not an IMU packet."""
+    if len(pkt) < PKT or pkt[0] != 0x01 or pkt[1] != 0x02:
+        return None
+    temp = struct.unpack_from("<h", pkt, 0x02)[0]
+    ts = struct.unpack_from("<Q", pkt, 0x04)[0]          # nanoseconds (device clock)
+    gmul, gdiv = struct.unpack_from("<hi", pkt, 0x0C)
+    gx, gy, gz = (_s24(pkt[o:o + 3]) for o in (0x12, 0x15, 0x18))
+    amul, adiv = struct.unpack_from("<hi", pkt, 0x1B)
+    ax, ay, az = (_s24(pkt[o:o + 3]) for o in (0x21, 0x24, 0x27))
+    mmul, mdiv = struct.unpack_from(">hi", pkt, 0x2A)    # magnetometer: big-endian
+    mx = _mag_s16(pkt[0x30], pkt[0x31])
+    my = _mag_s16(pkt[0x32], pkt[0x33])
+    mz = _mag_s16(pkt[0x34], pkt[0x35])
+
+    def scaled(raw, mul, div):
+        return (raw * mul / div) if div else 0.0
+
+    return {
+        "ts_ns": ts,
+        # ICM-42688-P datasheet: offset 25 degC, sensitivity 132.48 LSB/degC
+        "temp_c": temp / 132.48 + 25.0,
+        "gx": scaled(gx, gmul, gdiv), "gy": scaled(gy, gmul, gdiv), "gz": scaled(gz, gmul, gdiv),
+        "ax": scaled(ax, amul, adiv), "ay": scaled(ay, amul, adiv), "az": scaled(az, amul, adiv),
+        # decoded for completeness; fusion deliberately ignores magnetometer
+        "mx": scaled(mx, mmul, mdiv), "my": scaled(my, mmul, mdiv), "mz": scaled(mz, mmul, mdiv),
+    }
+
+
+# ------------------------------------------------------------------- fusion
+
+class Madgwick:
+    """Madgwick IMU(AHRS) filter - gyro in rad/s; accel any consistent units.
+    Magnetometer input is accepted but ignored: the reference driver found
+    the Air's mag data degrades fusion quality."""
+
+    def __init__(self, beta=0.08):
+        self.q = [1.0, 0.0, 0.0, 0.0]
+        self.beta = beta
+
+    def update(self, gx, gy, gz, ax, ay, az, dt):
+        q0, q1, q2, q3 = self.q
+        an = math.sqrt(ax * ax + ay * ay + az * az)
+        if an < 1e-6:
+            self._integrate(gx, gy, gz, dt)
+            return
+        ax, ay, az = ax / an, ay / an, az / an
+
+        _2q0q2, _2q2q3 = 2 * q0 * q2, 2 * q2 * q3
+        q0q0, q0q1, q0q2, q0q3 = q0 * q0, q0 * q1, q0 * q2, q0 * q3
+        q1q1, q1q2, q1q3 = q1 * q1, q1 * q2, q1 * q3
+        q2q2, q2q3, q3q3 = q2 * q2, q2 * q3, q3 * q3
+
+        s0 = -_2q2 * (2 * (q1q3 - q0q2) - ax) + _2q0q2 * 0 + _2q1 * (2 * (q0q1 + q2q3) - ay)
+        s1 = (_2q2q3 * 0 + _2q3 * (2 * (q1q3 - q0q2) - ax) + _2q0 * (2 * (q0q1 + q2q3) - ay)
+              - 4 * q1 * (2 * (q2q2 + q3q3) - az))
+        s2 = (-_2q0 * (2 * (q1q3 - q0q2) - ax) + _2q3 * (2 * (q0q1 + q2q3) - ay)
+              - 4 * q2 * (2 * (q1q1 + q3q3) - az))
+        s3 = _2q1 * (2 * (q1q3 - q0q2) - ax) + _2q2 * (2 * (q0q1 + q2q3) - ay)
+
+        sn = math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3)
+        if sn > 1e-6:
+            s0, s1, s2, s3 = s0 / sn, s1 / sn, s2 / sn, s3 / sn
+            q0 -= self.beta * s0
+            q1 -= self.beta * s1
+            q2 -= self.beta * s2
+            q3 -= self.beta * s3
+        self.q = [q0, q1, q2, q3]
+        self._integrate(gx, gy, gz, dt)
+
+    def _integrate(self, gx, gy, gz, dt):
+        q0, q1, q2, q3 = self.q
+        q0 += dt * 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
+        q1 += dt * 0.5 * (q0 * gx + q2 * gz - q3 * gy)
+        q2 += dt * 0.5 * (q0 * gy - q1 * gz + q3 * gx)
+        q3 += dt * 0.5 * (q0 * gz + q1 * gy - q2 * gx)
+        n = math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3) or 1.0
+        self.q = [q0 / n, q1 / n, q2 / n, q3 / n]
+
+
+def euler_deg(q):
+    """quaternion -> (roll, pitch, yaw) in degrees."""
+    w, x, y, z = q
+    roll = math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x)))))
+    yaw = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+    return roll, pitch, yaw
+
+
+# ------------------------------------------------------------------- hid glue
 
 def _connect(path):
     """Open an HID device with whichever 'hid' binding is installed
@@ -122,138 +217,13 @@ def _connect(path):
     return dev, rd
 
 
-def _s24(b: bytes) -> int:
-    """3-byte little-endian signed integer (two's complement)."""
-    v = b[0] | (b[1] << 8) | (b[2] << 16)
-    return v - (1 << 24) if v & 0x800000 else v
-
-
-def decode(pkt: bytes):
-    """Parse one 64-byte IMU event packet -> dict, or None if not an IMU packet."""
-    if len(pkt) < PKT or pkt[0] != 0x01 or pkt[1] != 0x02:
-        return None
-    temp = struct.unpack_from("<H", pkt, 0x02)[0]
-    ts = struct.unpack_from("<Q", pkt, 0x04)[0]          # nanoseconds (device clock)
-    gmul, gdiv = struct.unpack_from("<HI", pkt, 0x0C)
-    gx, gy, gz = (_s24(pkt[o:o + 3]) for o in (0x12, 0x15, 0x18))
-    amul, adiv = struct.unpack_from("<HI", pkt, 0x1B)
-    ax, ay, az = (_s24(pkt[o:o + 3]) for o in (0x21, 0x24, 0x27))
-    mmul, mdiv = struct.unpack_from("<HI", pkt, 0x2A)
-    mx, my, mz = struct.unpack_from("<hhh", pkt, 0x30)
-
-    def scaled(raw, mul, div):
-        return (raw * mul / div) if div else 0.0
-
-    return {
-        "ts_ns": ts, "temp_raw": temp,
-        "gx": scaled(gx, gmul, gdiv), "gy": scaled(gy, gmul, gdiv), "gz": scaled(gz, gmul, gdiv),
-        "ax": scaled(ax, amul, adiv), "ay": scaled(ay, amul, adiv), "az": scaled(az, amul, adiv),
-        "mx": scaled(mx, mmul, mdiv), "my": scaled(my, mmul, mdiv), "mz": scaled(mz, mmul, mdiv),
-    }
-
-
-# ------------------------------------------------------------------- fusion
-
-class Madgwick:
-    """Madgwick MARG filter. gyro in rad/s; accel & mag any consistent units."""
-
-    def __init__(self, beta=0.08):
-        self.q = [1.0, 0.0, 0.0, 0.0]
-        self.beta = beta
-
-    def update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
-        q0, q1, q2, q3 = self.q
-        an = math.sqrt(ax * ax + ay * ay + az * az)
-        if an < 1e-6:
-            self._integrate(gx, gy, gz, dt)
-            return
-        ax, ay, az = ax / an, ay / an, az / an
-
-        mn = math.sqrt(mx * mx + my * my + mz * mz)
-        if mn > 1e-3:  # magnetometer present -> full MARG correction
-            mx, my, mz = mx / mn, my / mn, mz / mn
-            _2q0mx, _2q0my, _2q0mz = 2 * q0 * mx, 2 * q0 * my, 2 * q0 * mz
-            _2q1mx = 2 * q1 * mx
-            _2q0 = 2 * q0
-            _2q1, _2q2, _2q3 = 2 * q1, 2 * q2, 2 * q3
-            _2q0q2, _2q2q3 = 2 * q0 * q2, 2 * q2 * q3
-            q0q0, q0q1, q0q2, q0q3 = q0 * q0, q0 * q1, q0 * q2, q0 * q3
-            q1q1, q1q2, q1q3 = q1 * q1, q1 * q2, q1 * q3
-            q2q2, q2q3, q3q3 = q2 * q2, q2 * q3, q3 * q3
-            hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3
-            hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3
-            _2bx = math.sqrt(hx * hx + hy * hy)
-            _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 + _2q2 * my * q3 - mz * q2q2 + mz * q3q3
-            _4bx, _4bz = 2 * _2bx, 2 * _2bz
-
-            s0 = (-_2q2 * (2 * q1q3 - _2q0q2 - ax) + _2q1 * (2 * q0q1 + _2q2q3 - ay)
-                  - _2bz * q2 * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
-                  + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
-                  + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz))
-            s1 = (_2q3 * (2 * q1q3 - _2q0q2 - ax) + _2q0 * (2 * q0q1 + _2q2q3 - ay)
-                  - 4 * q1 * (1 - 2 * q1q1 - 2 * q2q2 - az)
-                  + _2bz * q3 * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
-                  + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
-                  + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz))
-            s2 = (-_2q0 * (2 * q1q3 - _2q0q2 - ax) + _2q3 * (2 * q0q1 + _2q2q3 - ay)
-                  - 4 * q2 * (1 - 2 * q1q1 - 2 * q2q2 - az)
-                  + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
-                  + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
-                  + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz))
-            s3 = (_2q1 * (2 * q1q3 - _2q0q2 - ax) + _2q2 * (2 * q0q1 + _2q2q3 - ay)
-                  + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5 - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx)
-                  + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my)
-                  + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5 - q1q1 - q2q2) - mz))
-        else:  # IMU-only (no magnetometer)
-            _2q0q2, _2q2q3 = 2 * q0 * q2, 2 * q2 * q3
-            q0q0, q0q1, q0q2, q0q3 = q0 * q0, q0 * q1, q0 * q2, q0 * q3
-            q1q1, q1q2, q1q3 = q1 * q1, q1 * q2, q1 * q3
-            q2q2, q2q3, q3q3 = q2 * q2, q2 * q3, q3 * q3
-            s0 = _2q0q2 * ax + _2q0q2 * az - _2q2q3 * ay if False else (
-                -_2q2 * (2 * (q1q3 - q0q2) - ax) + _2q1 * (2 * (q0q1 + q2q3) - ay))
-            s1 = (_2q3 * (2 * (q1q3 - q0q2) - ax) + _2q0 * (2 * (q0q1 + q2q3) - ay)
-                  - 4 * q1 * (2 * (q2q2 + q3q3) - az))
-            s2 = (-_2q0 * (2 * (q1q3 - q0q2) - ax) + _2q3 * (2 * (q0q1 + q2q3) - ay)
-                  - 4 * q2 * (2 * (q1q1 + q3q3) - az))
-            s3 = _2q1 * (2 * (q1q3 - q0q2) - ax) + _2q2 * (2 * (q0q1 + q2q3) - ay)
-
-        sn = math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3)
-        if sn > 1e-6:
-            s0, s1, s2, s3 = s0 / sn, s1 / sn, s2 / sn, s3 / sn
-            q0 -= self.beta * s0
-            q1 -= self.beta * s1
-            q2 -= self.beta * s2
-            q3 -= self.beta * s3
-        self.q = [q0, q1, q2, q3]
-        self._integrate(gx, gy, gz, dt)
-
-    def _integrate(self, gx, gy, gz, dt):
-        q0, q1, q2, q3 = self.q
-        q0 += dt * 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
-        q1 += dt * 0.5 * (q0 * gx + q2 * gz - q3 * gy)
-        q2 += dt * 0.5 * (q0 * gy - q1 * gz + q3 * gx)
-        q3 += dt * 0.5 * (q0 * gz + q1 * gy - q2 * gx)
-        n = math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3) or 1.0
-        self.q = [q0 / n, q1 / n, q2 / n, q3 / n]
-
-
-def euler_deg(q):
-    """quaternion -> (roll, pitch, yaw) in degrees."""
-    w, x, y, z = q
-    roll = math.degrees(math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
-    pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x)))))
-    yaw = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
-    return roll, pitch, yaw
-
-
 # ------------------------------------------------------------------- reader
 
 class ImuReader(threading.Thread):
     """Opens the glasses' IMU HID interface, fuses samples, publishes euler state."""
 
-    # scaling: the packet's mult/div fields put gyro in deg/s (verify with
-    # --dump: rotate ~90 deg in one second, peaks should read ~90). Set
-    # GYRO_DPS_TO_RAD to 1.0 if a future firmware reports rad/s instead.
+    # packet's mult/div fields put gyro in deg/s (confirmed against the
+    # reference driver, which feeds Fusion in degrees).
     GYRO_DPS_TO_RAD = math.pi / 180.0
 
     def __init__(self, dump=False):
@@ -261,12 +231,13 @@ class ImuReader(threading.Thread):
         self.dump = dump
         self.filter = Madgwick()
         self.dev = None
+        self._rd = None
         self.state = {"ok": False, "hz": 0.0, "pitch": 0.0, "bank": 0.0,
                       "yaw": 0.0, "g": 1.0, "temp_c": 0.0}
         self._stop = threading.Event()
         self._recenter = threading.Event()
         self._offsets = [0.0, 0.0, 0.0]
-        self._one_g = None     # accel norm measured at rest -> defines 1g
+        self._one_g = None
         self._rest_vals = []
 
     # -- device discovery ------------------------------------------------
@@ -275,44 +246,85 @@ class ImuReader(threading.Thread):
             devs = hid.enumerate(VID, 0)
         except TypeError:  # python-hid has a different enumerate signature
             devs = [d for d in hid.enumerate() if d.get("vendor_id") == VID]
-        # IMU interface is 3 on the original Air; other models differ, so
-        # probe interface-3 first, then everything else as fallback.
-        devs.sort(key=lambda d: 0 if d.get("interface_number") == 3 else 1)
+        if not devs:
+            try:
+                devs = [d for d in hid.enumerate() if d.get("vendor_id") == VID]
+            except Exception:
+                devs = []
+
+        def rank(d):
+            pid = d.get("product_id")
+            want_if = KNOWN_PIDS.get(pid)
+            if want_if is not None and d.get("interface_number") == want_if:
+                return 0                      # known product, known IMU iface
+            if pid in KNOWN_PIDS:
+                return 1
+            return 2                          # unknown: probe anyway
+
+        devs.sort(key=rank)
         return [d["path"] for d in devs if d.get("path")]
 
+    # -- reference driver's init handshake --------------------------------
+    def _init_stream(self, dev, rd) -> bool:
+        dev.write(build_msg(MSG_STREAM, b"\x00"))       # stop any active stream
+        for _ in range(10):                             # drain stale packets
+            if not rd(PKT, 20):
+                break
+        _recv_msg(rd, MSG_STATIC_ID, 4, 300)            # optional: static id
+        dev.write(build_msg(MSG_CAL_LENGTH))
+        cal_len_b = _recv_msg(rd, MSG_CAL_LENGTH, 4, 300)
+        if cal_len_b:
+            cal_len = struct.unpack("<I", cal_len_b)[0]
+            drained = 0
+            for _ in range(512):                        # cap: 512*56 = 28 KiB
+                if drained >= cal_len:
+                    break
+                dev.write(build_msg(MSG_CAL_SEGMENT))
+                seg = _recv_msg(rd, MSG_CAL_SEGMENT, min(56, cal_len - drained), 300)
+                if not seg:
+                    break
+                drained += len(seg)
+        dev.write(build_msg(MSG_STREAM, b"\x01"))       # start stream
+        end = time.monotonic() + 1.0
+        while time.monotonic() < end:                   # confirm packets flow
+            pkt = rd(PKT, 200)
+            if pkt and decode(bytes(pkt)):
+                return True
+        return False
+
     def _try_open(self, path):
-        for span in ("padded", "minimal"):
-            dev = None
+        try:
+            dev, rd = _connect(path)
+        except Exception:
+            return None
+        try:
+            if self._init_stream(dev, rd):
+                self._rd = rd
+                return dev
+            dev.close()
+        except Exception:
             try:
-                dev, rd = _connect(path)
-                dev.write(build_enable(span))
-                pkt = rd(PKT, 300)
-                if pkt and decode(bytes(pkt)):
-                    self._rd = rd
-                    return dev, span
                 dev.close()
             except Exception:
-                try:
-                    if dev:
-                        dev.close()
-                except Exception:
-                    pass
-        return None, None
+                pass
+        return None
 
     def open(self):
         paths = self._candidates()
         if not paths:
             raise RuntimeError(
-                "no 0x3318 USB devices found - is the Air plugged in via the Deck's USB-C?")
+                "no 0x3318 USB devices found - is the Air plugged into the "
+                "Deck's USB-C port (top port) and awake?")
         for p in paths:
-            dev, span = self._try_open(p)
+            dev = self._try_open(p)
             if dev:
                 self.dev = dev
-                print(f"[imu] stream open (checksum span: {span})", flush=True)
+                print("[imu] stream open", flush=True)
                 return
         raise RuntimeError(
-            "found Xreal USB devices but no IMU stream - check that "
-            "wheaney's xr-driver service is stopped (it owns the device)")
+            "Xreal devices present but the IMU handshake got no data. "
+            "Most likely: replug the glasses (udev rule applies on plug), or "
+            "check permissions on /dev/hidraw* - see README step 1.")
 
     # -- lifecycle --------------------------------------------------------
     def stop(self):
@@ -352,11 +364,10 @@ class ImuReader(threading.Thread):
                 continue  # first sample, or a gap -> don't integrate garbage
 
             gx, gy, gz = (s[k] * self.GYRO_DPS_TO_RAD for k in ("gx", "gy", "gz"))
-            self.filter.update(gx, gy, gz, s["ax"], s["ay"], s["az"],
-                               s["mx"], s["my"], s["mz"], dt)
+            self.filter.update(gx, gy, gz, s["ax"], s["ay"], s["az"], dt)
             roll, pitch, yaw = euler_deg(self.filter.q)
 
-            # auto-calibrate 1g from the first ~1s of samples (assumes still)
+            # auto-calibrate 1g from the first ~100 samples (assumes still)
             if self._one_g is None:
                 an = math.sqrt(s["ax"] ** 2 + s["ay"] ** 2 + s["az"] ** 2)
                 if an > 0:
@@ -384,15 +395,18 @@ class ImuReader(threading.Thread):
                               pitch=pitch - o_pitch,
                               yaw=(yaw - o_yaw + 180) % 360 - 180,
                               g=g_force,
-                              temp_c=s["temp_raw"] / 333.87 + 21.0)  # ICM-20602 datasheet
+                              temp_c=s["temp_c"])
 
     def close(self):
         if self.dev:
             try:
-                self.dev.write(build_disable())
+                self.dev.write(build_msg(MSG_STREAM, b"\x00"))
             except Exception:
                 pass
-            self.dev.close()
+            try:
+                self.dev.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -405,6 +419,7 @@ if __name__ == "__main__":
                 time.sleep(1)
         except KeyboardInterrupt:
             r.stop()
+            r.close()
     else:
         r = ImuReader()
         r.start()
@@ -415,3 +430,4 @@ if __name__ == "__main__":
                        for k, v in r.state.items()}, flush=True)
         except KeyboardInterrupt:
             r.stop()
+            r.close()
