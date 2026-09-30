@@ -114,7 +114,7 @@ LADDER_DEGS = [-30, -20, -10, 0, 10, 20, 30]
 def xf(x, y, pitch, bank):
     pitch = max(-60.0, min(60.0, pitch))
 
-    y += pitch * 1.5
+    y += pitch * 1
     a = math.radians(bank)
 
     dx, dy = x - CX, y - CY
