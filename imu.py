@@ -214,7 +214,7 @@ class Madgwick:
     def _integrate(self, gx, gy, gz, dt):
     # Integrate from one consistent quaternion state.
     # All derivatives must use the same old q0/q1/q2/q3.
-    q0, q1, q2, q3 = self.q
+        q0, q1, q2, q3 = self.q
 
     dq0 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
     dq1 = 0.5 * ( q0 * gx + q2 * gz - q3 * gy)
