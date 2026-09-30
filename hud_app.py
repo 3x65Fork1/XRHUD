@@ -112,9 +112,12 @@ LADDER_DEGS = [-30, -20, -10, 0, 10, 20, 30]
 
 
 def xf(x, y, pitch, bank):
-    pitch = max(-60.0, min(60.0, pitch))
+    # Convert pitch into a smooth, bounded screen displacement.
+    # Large IMU angles asymptotically approach the limit instead of snapping.
+    pitch_offset = 75.0 * math.tanh(pitch / 45.0)
 
-    y += pitch * 1
+    y += pitch_offset
+
     a = math.radians(bank)
 
     dx, dy = x - CX, y - CY
