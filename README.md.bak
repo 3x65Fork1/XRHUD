@@ -2,12 +2,13 @@
 
 Deck-side of the HUD: reads the glasses' IMU over USB, fuses attitude with a
 Madgwick filter, and renders a fighter-jet HUD (pitch ladder + bank arc,
-speed, clock, GPS tile) in a native pygame application.
+speed, clock, GPS tile) in a fullscreen browser on the glasses' display.
 
 ```
 Xreal Air ──USB-C──► Steam Deck (this code)
   IMU @ ~200-1000 Hz     imu.py   (HID reader + Madgwick fusion)
-  Video @ 1080p          hud_app.py (native pygame app)
+  Video @ 1080p          server.py (WebSocket broadcaster + static + GPS UDP)
+                         firefox --kiosk -> http://127.0.0.1:8675/
 
 GrapheneOS phone ──Wi-Fi──► Deck UDP :8676   (built next phase)
   GPS @ 1 Hz              {"lat","lon","speed"(m/s),"sats","hdop"}
@@ -16,14 +17,14 @@ GrapheneOS phone ──Wi-Fi──► Deck UDP :8676   (built next phase)
 ## Setup
 
 ```bash
-sudo pacman -S python-hidapi python-pygame
+sudo pacman -S python-hidapi python-websockets firefox
 sudo cp 50-xreal-hud.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 # replug the glasses once so the rule applies
-./install.sh
+./run.sh
 ```
 
-No glasses handy, or developing at a desk? `./install.sh --demo` runs the full
+No glasses handy, or developing at a desk? `./run.sh --demo` runs the full
 pipeline on synthetic motion + fake GPS.
 
 If you have wheaney's `xr-driver` installed, stop it first — it owns the HID
@@ -57,7 +58,7 @@ device: `sudo systemctl stop xr-driver`.
   standard CRC32 framing, full init handshake, magnetometer decoded but
   unused (it degrades fusion on this hardware).
 - **CPU:** fusion runs at whatever rate the glasses stream (up to ~1 kHz) and
-  costs a few percent of one core; the pygame app gets 60 Hz updates.
+  costs a few percent of one core; the browser gets 60 Hz updates.
 - **Black background:** on the Air's optical see-through panels, black pixels
   are transparent — the HUD floats over the real world. Lines are drawn at
   1.5–2.4 px to survive the microdisplay's pixel grid.
