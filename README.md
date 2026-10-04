@@ -4,28 +4,35 @@ A native Python/pygame HUD for Xreal Air glasses running from a Steam Deck.
 
 XRHUD reads the glasses' IMU over USB, performs attitude fusion with a Madgwick filter, and renders a fighter-jet-style HUD with pitch, bank, speed, and GPS information.
 
-System overview
-Xreal Air
-    │
-    │ USB-C
-    ▼
-Steam Deck
-    │
-    ├── imu.py
-    │     └── HID IMU reader + Madgwick fusion
-    │
-    └── hud_app.py
-          ├── Pitch / bank
-          ├── G-force
-          ├── Speed
-          └── GPS
-               ▲
-               │ UDP :8676
-               │
-          Android phone
-               │
-               └── XRHUDAPP
-                    └── GPS + GPS-derived speed
+System Overview
+┌──────────────────┐
+│    Xreal Air     │
+│       IMU        │
+└────────┬─────────┘
+         │ USB-C
+         ▼
+┌──────────────────┐
+│    Steam Deck    │
+│                  │
+│     imu.py       │
+│  HID + Madgwick  │
+│        │         │
+│        ▼         │
+│   hud_app.py     │◄──────────────┐
+│                  │               │
+│  Pitch / Bank    │               │
+│  G-force         │               │
+│  Speed / GPS     │               │
+└────────┬─────────┘               │
+         │                         │
+         │ UDP :8676               │
+         │                         │
+         │               ┌─────────┴─────────┐
+         │               │   Android Phone   │
+         └───────────────┤     XRHUDAPP      │
+                         │                   │
+                         │ GPS + GPS Speed  │
+                         └───────────────────┘
 
 
 The Android companion app is available here:
@@ -60,7 +67,7 @@ Gamepad controls
 
 Demo mode for development without glasses
 
-GPS and speed
+GPS and Speed
 
 GPS data comes from an Android phone running XRHUDAPP.
 
@@ -68,10 +75,11 @@ The phone obtains its location and speed directly from Android's GPS/location AP
 
 The Deck listens on:
 
-UDP :8676
+UDP port 8676
 
+Packet Format
 
-The packet format is JSON:
+The phone sends JSON packets:
 
 {
   "lat": 51.5073,
@@ -86,20 +94,30 @@ speed is supplied in m/s.
 
 XRHUD converts the value to the currently selected display unit:
 
-m/s → km/h
-m/s → mph
+m/s ──► km/h
+  │
+  └───► mph
 
-Network setup
+Network Setup
 
 The phone and Steam Deck need to be able to communicate over the network.
 
 A simple setup is:
 
-Android phone
-    │
-    │ Wi-Fi hotspot
-    ▼
-Steam Deck
+┌──────────────────┐
+│   Android Phone  │
+│                  │
+│   Wi-Fi Hotspot  │
+└────────┬─────────┘
+         │
+         │ Wi-Fi
+         ▼
+┌──────────────────┐
+│    Steam Deck    │
+│                  │
+│   hud_app.py     │
+│   UDP :8676      │
+└──────────────────┘
 
 
 The Steam Deck's IP address is entered into XRHUDAPP.
@@ -111,7 +129,7 @@ The Android app sends packets specifically to:
 
 It does not broadcast GPS data to the network.
 
-Testing the GPS connection
+Testing the GPS Connection
 
 On the Steam Deck:
 
@@ -137,24 +155,37 @@ python3 imu.py --dump
 
 You should see a stream of accelerometer and gyroscope values.
 
-Run the fused IMU:
+Run the fused IMU with:
 
 python3 imu.py
 
 
 Pitch and bank should respond to head movement.
 
-G-force
+G-Force
 
 The accelerometer data is used for the HUD's G-force display.
 
 The IMU provides acceleration independently of the GPS speed system:
 
-IMU
- └── acceleration → G-force display
+Xreal Air IMU
+      │
+      ▼
+Accelerometer
+      │
+      ▼
+G-force display
 
-GPS
- └── GPS speed → speed display
+
+GPS speed is handled separately:
+
+Android GPS
+     │
+     ▼
+GPS-derived speed
+     │
+     ▼
+Speed display
 
 
 This keeps instantaneous acceleration/G-force measurement separate from GPS-derived vehicle speed.
@@ -179,7 +210,7 @@ Then:
 
 ./install.sh
 
-Demo mode
+Demo Mode
 
 Development can be done without the glasses:
 
@@ -236,17 +267,15 @@ The selected speed unit is persisted in:
 
 ~/.config/xreal-hud/unit
 
-First-run checklist
+First-Run Checklist
 
 Start the HUD with your head reasonably still.
 
 The IMU performs its initial 1g calibration from the first samples.
 
-Check:
+Run python3 imu.py --dump and verify IMU data.
 
-python3 imu.py --dump produces IMU data.
-
-python3 imu.py produces sensible pitch/bank values.
+Run python3 imu.py and verify sensible pitch/bank values.
 
 Launch hud_app.py.
 
@@ -278,42 +307,48 @@ Wi-Fi connection between phone and Steam Deck
 
 Architecture
 
-XRHUD intentionally separates the two major sensor systems:
+XRHUD intentionally separates the two major sensor systems.
 
-                ┌──────────────────┐
-                │   Xreal Air IMU  │
-                └────────┬─────────┘
-                         │ USB
-                         ▼
-                    ┌─────────┐
-                    │ imu.py  │
-                    └────┬────┘
-                         │
-                         ▼
-                  Pitch / Bank / G
-                         │
-                         ▼
-                    ┌─────────┐
-                    │hud_app.py│
-                    └────┬────┘
-                         │
-                         ▼
-                     Xreal Air
+IMU / Orientation
+┌──────────────────┐
+│    Xreal Air     │
+│       IMU        │
+└────────┬─────────┘
+         │ USB
+         ▼
+┌──────────────────┐
+│      imu.py      │
+│                  │
+│ HID reader       │
+│ Madgwick fusion  │
+└────────┬─────────┘
+         │
+         ▼
+   Pitch / Bank / G
+         │
+         ▼
+┌──────────────────┐
+│    hud_app.py    │
+└────────┬─────────┘
+         │
+         ▼
+     Xreal Air
 
-
+GPS / Speed
 ┌──────────────────┐
 │  Android Phone   │
 │                  │
 │ GPS + GPS speed  │
 └────────┬─────────┘
+         │
          │ UDP :8676
          ▼
-   ┌─────────────┐
-   │ hud_app.py  │
-   └──────┬──────┘
-          │
-          ▼
-      Speed / GPS
+┌──────────────────┐
+│    hud_app.py    │
+└────────┬─────────┘
+         │
+         ▼
+    Speed / GPS
 
 
 This means GPS speed does not depend on integrating the IMU accelerometer, while the IMU remains responsible for the HUD's instantaneous acceleration/G-force information.
@@ -333,5 +368,6 @@ IMU fusion runs at the rate supplied by the glasses, while the pygame HUD render
 The Android phone is only responsible for GPS/location data; it does not replace the Xreal IMU.
 
 License
+This project is licensed under the MIT License.
 
-See the repository for licensing information.
+You are free to use, copy, modify, merge, publish, distribute, sublicense, and sell this software, provided that the original copyright notice and license are retained.
