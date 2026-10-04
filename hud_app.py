@@ -606,11 +606,11 @@ class Hud:
         # -------------------------------------------------------------------
 
         pitch = float(
-            imu.get("pitch", 0.0)
+            imu.get("bank", 0.0)
         )
 
         bank = float(
-            imu.get("bank", 0.0)
+            imu.get("pitch", 0.0)
         )
 
         yaw = float(
