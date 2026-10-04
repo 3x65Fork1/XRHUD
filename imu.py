@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Xreal Air IMU reader + Madgwick fusion.
+Xreal Air IMU reader + quaternion AHRS.
 
-Supports both:
+Supports:
   - python-hidapi: hid.device()
   - python-hid:    hid.Device()
 
@@ -13,6 +13,30 @@ The Xreal Air uses:
 
 Protocol:
   [0xAA][crc32 u32le][len u16le][msgid u8][data...]
+
+Orientation:
+  - Gyroscope provides fast rotational response.
+  - Accelerometer provides gravity reference for roll/pitch.
+  - Accelerometer correction is reduced during strong linear motion.
+  - Yaw is gyro-integrated and will drift because the magnetometer
+    is decoded but intentionally not used for heading correction.
+  - Recenter stores a quaternion reference rather than subtracting
+    Euler angles.
+
+The public ImuReader.state interface remains:
+
+    {
+        "ok": bool,
+        "hz": float,
+        "pitch": float,
+        "bank": float,
+        "yaw": float,
+        "g": float,
+        "temp_c": float,
+    }
+
+No axis swapping is performed here. If the HUD deliberately maps
+pitch/bank differently, that remains the HUD's responsibility.
 """
 
 import math
@@ -26,10 +50,18 @@ import zlib
 try:
     import hid
 except ImportError:
-    sys.exit("missing dependency: sudo pacman -S python-hidapi (or python-hid)")
+    sys.exit(
+        "missing dependency: sudo pacman -S python-hidapi "
+        "(or python-hid)"
+    )
 
+
+# ---------------------------------------------------------------------------
+# Xreal device / protocol
+# ---------------------------------------------------------------------------
 
 VID = 0x3318
+
 KNOWN_PIDS = {
     0x0424: 3,  # Xreal Air
     0x0428: 3,  # Xreal Air 2
@@ -45,12 +77,58 @@ MSG_STREAM = 0x19
 MSG_STATIC_ID = 0x1A
 
 
-# ---------------------------------------------------------------- packet codec
+# ---------------------------------------------------------------------------
+# Tuning
+# ---------------------------------------------------------------------------
+
+# Mahony proportional feedback.
+#
+# Larger = stronger gravity correction, but more sensitivity to
+# acceleration/vibration.
+MAHONY_KP = 1.8
+
+# Integral gyro-bias correction.
+#
+# Kept deliberately small because the explicit startup gyro calibration
+# already removes most of the static bias.
+MAHONY_KI = 0.015
+
+# Number of samples used to estimate gyro bias at startup.
+GYRO_CAL_SAMPLES = 150
+
+# Number of samples used to establish the initial 1g reference.
+ACCEL_CAL_SAMPLES = 150
+
+# Nominal gravity magnitude is whatever the sensor reports during startup.
+# This makes the G meter independent of the sensor's raw scaling.
+ACCEL_MIN_G = 0.70
+ACCEL_MAX_G = 1.30
+
+# Below this interval, the accelerometer is considered trustworthy.
+# Between MIN and MAX the correction is gradually reduced.
+ACCEL_FULL_WEIGHT = 0.97
+ACCEL_ZERO_WEIGHT = 0.20
+
+# Final orientation smoothing inside the sensor thread.
+#
+# The HUD already performs additional frame-rate-independent smoothing,
+# so this is intentionally mild.
+ORIENTATION_SMOOTH_TAU = 0.025
+
+GYRO_DPS_TO_RAD = math.pi / 180.0
+
+
+# ---------------------------------------------------------------------------
+# Packet codec
+# ---------------------------------------------------------------------------
 
 def build_msg(msgid: int, data: bytes = b"") -> bytes:
     """Build an Xreal framed command."""
     body = struct.pack("<HB", 3 + len(data), msgid) + data
-    return b"\xAA" + struct.pack("<I", zlib.crc32(body) & 0xFFFFFFFF) + body
+    return b"\xAA" + struct.pack(
+        "<I",
+        zlib.crc32(body) & 0xFFFFFFFF,
+    ) + body
 
 
 def _recv_msg(rd, msgid: int, want_len: int, timeout_ms: int):
@@ -65,7 +143,11 @@ def _recv_msg(rd, msgid: int, want_len: int, timeout_ms: int):
 
         pkt = bytes(pkt)
 
-        if len(pkt) >= 8 and pkt[0] == 0xAA and pkt[7] == msgid:
+        if (
+            len(pkt) >= 8
+            and pkt[0] == 0xAA
+            and pkt[7] == msgid
+        ):
             return pkt[8:8 + want_len]
 
     return None
@@ -74,18 +156,33 @@ def _recv_msg(rd, msgid: int, want_len: int, timeout_ms: int):
 def _s24(b: bytes) -> int:
     """3-byte little-endian signed integer."""
     v = b[0] | (b[1] << 8) | (b[2] << 16)
-    return v - (1 << 24) if v & 0x800000 else v
+
+    return (
+        v - (1 << 24)
+        if v & 0x800000
+        else v
+    )
 
 
 def _mag_s16(b0: int, b1: int) -> int:
     """Magnetometer reading with inverted sign bit."""
     v = b0 | ((b1 ^ 0x80) << 8)
-    return v - (1 << 16) if v & 0x8000 else v
+
+    return (
+        v - (1 << 16)
+        if v & 0x8000
+        else v
+    )
 
 
 def decode(pkt: bytes):
     """Decode a 64-byte Xreal IMU event packet."""
-    if len(pkt) < PKT or pkt[0] != 0x01 or pkt[1] != 0x02:
+
+    if (
+        len(pkt) < PKT
+        or pkt[0] != 0x01
+        or pkt[1] != 0x02
+    ):
         return None
 
     temp = struct.unpack_from("<h", pkt, 0x02)[0]
@@ -112,7 +209,11 @@ def decode(pkt: bytes):
     mz = _mag_s16(pkt[0x34], pkt[0x35])
 
     def scaled(raw, mul, div):
-        return (raw * mul / div) if div else 0.0
+        return (
+            raw * mul / div
+            if div
+            else 0.0
+        )
 
     return {
         "ts_ns": ts,
@@ -126,139 +227,405 @@ def decode(pkt: bytes):
         "ay": scaled(ay, amul, adiv),
         "az": scaled(az, amul, adiv),
 
+        # Kept for future compass fusion.
         "mx": scaled(mx, mmul, mdiv),
         "my": scaled(my, mmul, mdiv),
         "mz": scaled(mz, mmul, mdiv),
     }
 
 
-# ------------------------------------------------------------------- fusion
+# ---------------------------------------------------------------------------
+# Quaternion utilities
+# ---------------------------------------------------------------------------
 
-class Madgwick:
-    """Madgwick IMU/AHRS filter."""
+def quat_normalize(q):
+    n = math.sqrt(
+        q[0] * q[0]
+        + q[1] * q[1]
+        + q[2] * q[2]
+        + q[3] * q[3]
+    )
 
-    def __init__(self, beta=0.08):
-        self.q = [1.0, 0.0, 0.0, 0.0]
-        self.beta = beta
+    if n < 1e-12:
+        return [1.0, 0.0, 0.0, 0.0]
 
-    def update(self, gx, gy, gz, ax, ay, az, dt):
-        q0, q1, q2, q3 = self.q
+    return [
+        q[0] / n,
+        q[1] / n,
+        q[2] / n,
+        q[3] / n,
+    ]
 
-        an = math.sqrt(ax * ax + ay * ay + az * az)
 
-        if an < 1e-6:
-            self._integrate(gx, gy, gz, dt)
-            return
+def quat_conjugate(q):
+    return [
+        q[0],
+        -q[1],
+        -q[2],
+        -q[3],
+    ]
 
-        ax, ay, az = ax / an, ay / an, az / an
 
-        _2q0 = 2 * q0
-        _2q1 = 2 * q1
-        _2q2 = 2 * q2
-        _2q3 = 2 * q3
-        _2q0q2 = 2 * q0 * q2
-        _2q2q3 = 2 * q2 * q3
+def quat_multiply(a, b):
+    """Hamilton quaternion multiplication."""
 
-        q0q0 = q0 * q0
-        q0q1 = q0 * q1
-        q0q2 = q0 * q2
-        q0q3 = q0 * q3
-        q1q1 = q1 * q1
-        q1q2 = q1 * q2
-        q1q3 = q1 * q3
-        q2q2 = q2 * q2
-        q2q3 = q2 * q3
-        q3q3 = q3 * q3
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
 
-        s0 = (
-            -_2q2 * (2 * (q1q3 - q0q2) - ax)
-            + _2q0q2 * 0
-            + _2q1 * (2 * (q0q1 + q2q3) - ay)
+    return [
+        aw * bw - ax * bx - ay * by - az * bz,
+
+        aw * bx + ax * bw + ay * bz - az * by,
+
+        aw * by - ax * bz + ay * bw + az * bx,
+
+        aw * bz + ax * by - ay * bx + az * bw,
+    ]
+
+
+def quat_relative(reference, current):
+    """
+    Orientation of current relative to reference.
+
+    q_relative = inverse(reference) * current
+    """
+
+    return quat_normalize(
+        quat_multiply(
+            quat_conjugate(reference),
+            current,
         )
+    )
 
-        s1 = (
-            _2q2q3 * 0
-            + _2q3 * (2 * (q1q3 - q0q2) - ax)
-            + _2q0 * (2 * (q0q1 + q2q3) - ay)
-            - 4 * q1 * (2 * (q2q2 + q3q3) - az)
-        )
 
-        s2 = (
-            -_2q0 * (2 * (q1q3 - q0q2) - ax)
-            + _2q3 * (2 * (q0q1 + q2q3) - ay)
-            - 4 * q2 * (2 * (q1q1 + q3q3) - az)
-        )
+def quat_slerp(a, b, t):
+    """Small-angle-safe quaternion interpolation."""
 
-        s3 = (
-            _2q1 * (2 * (q1q3 - q0q2) - ax)
-            + _2q2 * (2 * (q0q1 + q2q3) - ay)
-        )
+    t = max(0.0, min(1.0, t))
 
-        sn = math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3)
+    dot = (
+        a[0] * b[0]
+        + a[1] * b[1]
+        + a[2] * b[2]
+        + a[3] * b[3]
+    )
 
-        if sn > 1e-6:
-            s0 /= sn
-            s1 /= sn
-            s2 /= sn
-            s3 /= sn
+    # Same orientation represented by opposite quaternion signs.
+    if dot < 0.0:
+        b = [-x for x in b]
+        dot = -dot
 
-            q0 -= self.beta * s0
-            q1 -= self.beta * s1
-            q2 -= self.beta * s2
-            q3 -= self.beta * s3
+    dot = max(-1.0, min(1.0, dot))
 
-        self.q = [q0, q1, q2, q3]
-
-        self._integrate(gx, gy, gz, dt)
-
-    def _integrate(self, gx, gy, gz, dt):
-        q0, q1, q2, q3 = self.q
-
-        q0 += dt * 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
-        q1 += dt * 0.5 * (q0 * gx + q2 * gz - q3 * gy)
-        q2 += dt * 0.5 * (q0 * gy - q1 * gz + q3 * gx)
-        q3 += dt * 0.5 * (q0 * gz + q1 * gy - q2 * gx)
-
-        n = math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3) or 1.0
-
-        self.q = [
-            q0 / n,
-            q1 / n,
-            q2 / n,
-            q3 / n,
+    if dot > 0.9995:
+        q = [
+            a[i] + t * (b[i] - a[i])
+            for i in range(4)
         ]
 
+        return quat_normalize(q)
 
-def euler_deg(q):
-    """Quaternion -> roll, pitch, yaw in degrees."""
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+
+    if abs(sin_theta) < 1e-8:
+        return list(a)
+
+    wa = math.sin((1.0 - t) * theta) / sin_theta
+    wb = math.sin(t * theta) / sin_theta
+
+    return [
+        wa * a[i] + wb * b[i]
+        for i in range(4)
+    ]
+
+
+def quaternion_to_euler(q):
+    """
+    Quaternion -> roll, pitch, yaw.
+
+    Roll and yaw use the standard atan2 representation.
+
+    Pitch uses atan2 rather than asin so it retains the existing
+    project's -180..+180 behaviour.
+    """
+
     w, x, y, z = q
 
     roll = math.degrees(
         math.atan2(
-            2 * (w * x + y * z),
-            1 - 2 * (x * x + y * y),
+            2.0 * (w * x + y * z),
+            1.0 - 2.0 * (x * x + y * y),
         )
     )
 
-    # Full-range pitch: -180..+180 instead of asin()'s -90..+90.
     pitch = math.degrees(
         math.atan2(
-            2 * (w * y - z * x),
-            1 - 2 * (y * y + x * x),
+            2.0 * (w * y - z * x),
+            1.0 - 2.0 * (y * y + x * x),
         )
     )
 
     yaw = math.degrees(
         math.atan2(
-            2 * (w * z + x * y),
-            1 - 2 * (y * y + x * x),
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
         )
     )
 
     return roll, pitch, yaw
 
 
-# ------------------------------------------------------------------- HID glue
+# ---------------------------------------------------------------------------
+# Mahony IMU filter
+# ---------------------------------------------------------------------------
+
+class MahonyIMU:
+    """
+    Quaternion Mahony AHRS using gyro + accelerometer.
+
+    This is intentionally a 6-axis filter.
+
+    Accelerometer:
+        stabilizes roll/pitch against gravity.
+
+    Gyroscope:
+        provides fast motion response and yaw.
+
+    Magnetometer:
+        not currently used because there is no magnetic calibration/
+        hard-iron/soft-iron compensation in this application.
+    """
+
+    def __init__(
+        self,
+        kp=MAHONY_KP,
+        ki=MAHONY_KI,
+    ):
+        self.q = [1.0, 0.0, 0.0, 0.0]
+
+        self.kp = kp
+        self.ki = ki
+
+        # Integral error used to estimate residual gyro bias.
+        self.integral = [0.0, 0.0, 0.0]
+
+    def reset(self):
+        self.q = [1.0, 0.0, 0.0, 0.0]
+        self.integral = [0.0, 0.0, 0.0]
+
+    def update(
+        self,
+        gx,
+        gy,
+        gz,
+        ax,
+        ay,
+        az,
+        dt,
+        accel_weight=1.0,
+    ):
+        """
+        Update orientation.
+
+        gx/gy/gz:
+            rad/s
+
+        ax/ay/az:
+            arbitrary accelerometer units
+
+        dt:
+            seconds
+
+        accel_weight:
+            0..1, controls how strongly gravity corrects orientation.
+        """
+
+        if dt <= 0.0:
+            return
+
+        # ------------------------------------------------------------------
+        # Normalize accelerometer.
+        # ------------------------------------------------------------------
+
+        an = math.sqrt(
+            ax * ax
+            + ay * ay
+            + az * az
+        )
+
+        if an < 1e-9:
+            accel_weight = 0.0
+        else:
+            ax /= an
+            ay /= an
+            az /= an
+
+        accel_weight = max(
+            0.0,
+            min(1.0, accel_weight),
+        )
+
+        # ------------------------------------------------------------------
+        # Estimated gravity direction from quaternion.
+        #
+        # This is the direction gravity should appear in body coordinates
+        # for the current orientation.
+        # ------------------------------------------------------------------
+
+        q0, q1, q2, q3 = self.q
+
+        vx = 2.0 * (
+            q1 * q3 - q0 * q2
+        )
+
+        vy = 2.0 * (
+            q0 * q1 + q2 * q3
+        )
+
+        vz = (
+            q0 * q0
+            - q1 * q1
+            - q2 * q2
+            + q3 * q3
+        )
+
+        # ------------------------------------------------------------------
+        # Gravity error.
+        #
+        # Cross product:
+        #
+        #     measured_gravity × estimated_gravity
+        #
+        # gives the rotation direction required to correct the estimate.
+        # ------------------------------------------------------------------
+
+        ex = (
+            ay * vz
+            - az * vy
+        )
+
+        ey = (
+            az * vx
+            - ax * vz
+        )
+
+        ez = (
+            ax * vy
+            - ay * vx
+        )
+
+        # ------------------------------------------------------------------
+        # Integral feedback.
+        #
+        # Only accumulate it when acceleration is considered trustworthy.
+        # This prevents head movement from becoming "stored gyro bias".
+        # ------------------------------------------------------------------
+
+        if (
+            self.ki > 0.0
+            and accel_weight > 0.5
+        ):
+            self.integral[0] += (
+                self.ki * ex * accel_weight * dt
+            )
+
+            self.integral[1] += (
+                self.ki * ey * accel_weight * dt
+            )
+
+            self.integral[2] += (
+                self.ki * ez * accel_weight * dt
+            )
+
+            # Prevent runaway integral correction.
+            for i in range(3):
+                self.integral[i] = max(
+                    -0.15,
+                    min(0.15, self.integral[i]),
+                )
+
+        else:
+            # Slowly bleed old integral correction when acceleration
+            # becomes unreliable.
+            decay = max(
+                0.0,
+                1.0 - 2.0 * dt,
+            )
+
+            self.integral = [
+                x * decay
+                for x in self.integral
+            ]
+
+        # ------------------------------------------------------------------
+        # Proportional gravity correction.
+        # ------------------------------------------------------------------
+
+        gx += (
+            self.kp
+            * ex
+            * accel_weight
+            + self.integral[0]
+        )
+
+        gy += (
+            self.kp
+            * ey
+            * accel_weight
+            + self.integral[1]
+        )
+
+        gz += (
+            self.kp
+            * ez
+            * accel_weight
+            + self.integral[2]
+        )
+
+        # ------------------------------------------------------------------
+        # Quaternion derivative.
+        # ------------------------------------------------------------------
+
+        half_dt = 0.5 * dt
+
+        qa = q0
+        qb = q1
+        qc = q2
+        qd = q3
+
+        q0 += (
+            -qb * gx
+            - qc * gy
+            - qd * gz
+        ) * half_dt
+
+        q1 += (
+            qa * gx
+            + qc * gz
+            - qd * gy
+        ) * half_dt
+
+        q2 += (
+            qa * gy
+            - qb * gz
+            + qd * gx
+        ) * half_dt
+
+        q3 += (
+            qa * gz
+            + qb * gy
+            - qc * gx
+        ) * half_dt
+
+        self.q = quat_normalize(
+            [q0, q1, q2, q3]
+        )
+
+
+# ---------------------------------------------------------------------------
+# HID glue
+# ---------------------------------------------------------------------------
 
 def _connect(path):
     """
@@ -300,12 +667,23 @@ def _connect(path):
 
         def rd(n, timeout_ms):
             try:
-                return dev.read(n, timeout_ms=timeout_ms)
+                return dev.read(
+                    n,
+                    timeout_ms=timeout_ms,
+                )
+
             except TypeError:
                 try:
-                    return dev.read(n, timeout_ms)
+                    return dev.read(
+                        n,
+                        timeout_ms,
+                    )
+
                 except TypeError:
-                    end = time.monotonic() + timeout_ms / 1000.0
+                    end = (
+                        time.monotonic()
+                        + timeout_ms / 1000.0
+                    )
 
                     while time.monotonic() < end:
                         pkt = dev.read(n)
@@ -320,10 +698,6 @@ def _connect(path):
         return dev, rd
 
     # python-hid
-    #
-    # IMPORTANT:
-    # python-hid's ctypes binding expects char* here, so use
-    # p_bytes rather than p_str.
     if hasattr(hid, "Device"):
         dev = hid.Device(path=p_bytes)
 
@@ -334,7 +708,11 @@ def _connect(path):
                 ((n,), {}),
             ):
                 try:
-                    return dev.read(*args, **kwargs)
+                    return dev.read(
+                        *args,
+                        **kwargs,
+                    )
+
                 except TypeError:
                     continue
 
@@ -348,18 +726,21 @@ def _connect(path):
     )
 
 
-# ------------------------------------------------------------------- reader
+# ---------------------------------------------------------------------------
+# IMU reader
+# ---------------------------------------------------------------------------
 
 class ImuReader(threading.Thread):
-    """Open the Xreal IMU, fuse samples, and publish orientation."""
-
-    GYRO_DPS_TO_RAD = math.pi / 180.0
+    """
+    Open the Xreal IMU, fuse samples, and publish orientation.
+    """
 
     def __init__(self, dump=False):
         super().__init__(daemon=True)
 
         self.dump = dump
-        self.filter = Madgwick()
+
+        self.filter = MahonyIMU()
 
         self.dev = None
         self._rd = None
@@ -377,28 +758,55 @@ class ImuReader(threading.Thread):
         self._stop = threading.Event()
         self._recenter = threading.Event()
 
-        self._offsets = [0.0, 0.0, 0.0]
+        # Gyro bias in rad/s.
+        self._gyro_bias = [0.0, 0.0, 0.0]
 
+        # Startup calibration.
+        self._gyro_samples = []
+        self._accel_samples = []
+
+        self._calibrated = False
         self._one_g = None
-        self._rest_vals = []
 
-    # -- device discovery ---------------------------------------------
+        # Quaternion at the moment of recenter.
+        self._reference_q = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+        # Light internal smoothing.
+        self._display_q = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+    # ------------------------------------------------------------------
+    # Device discovery
+    # ------------------------------------------------------------------
 
     def _candidates(self):
         try:
             devs = hid.enumerate(VID, 0)
+
         except TypeError:
             devs = [
-                d for d in hid.enumerate()
+                d
+                for d in hid.enumerate()
                 if d.get("vendor_id") == VID
             ]
 
         if not devs:
             try:
                 devs = [
-                    d for d in hid.enumerate()
+                    d
+                    for d in hid.enumerate()
                     if d.get("vendor_id") == VID
                 ]
+
             except Exception:
                 devs = []
 
@@ -425,11 +833,18 @@ class ImuReader(threading.Thread):
             if d.get("path")
         ]
 
-    # -- reference driver's init handshake ----------------------------
+    # ------------------------------------------------------------------
+    # Xreal initialization handshake
+    # ------------------------------------------------------------------
 
     def _init_stream(self, dev, rd) -> bool:
         # Stop any active stream.
-        dev.write(build_msg(MSG_STREAM, b"\x00"))
+        dev.write(
+            build_msg(
+                MSG_STREAM,
+                b"\x00",
+            )
+        )
 
         # Drain stale packets.
         for _ in range(10):
@@ -445,7 +860,9 @@ class ImuReader(threading.Thread):
         )
 
         # Calibration length.
-        dev.write(build_msg(MSG_CAL_LENGTH))
+        dev.write(
+            build_msg(MSG_CAL_LENGTH)
+        )
 
         cal_len_b = _recv_msg(
             rd,
@@ -455,7 +872,10 @@ class ImuReader(threading.Thread):
         )
 
         if cal_len_b:
-            cal_len = struct.unpack("<I", cal_len_b)[0]
+            cal_len = struct.unpack(
+                "<I",
+                cal_len_b,
+            )[0]
 
             drained = 0
 
@@ -470,7 +890,10 @@ class ImuReader(threading.Thread):
                 seg = _recv_msg(
                     rd,
                     MSG_CAL_SEGMENT,
-                    min(56, cal_len - drained),
+                    min(
+                        56,
+                        cal_len - drained,
+                    ),
                     300,
                 )
 
@@ -480,9 +903,14 @@ class ImuReader(threading.Thread):
                 drained += len(seg)
 
         # Start IMU streaming.
-        dev.write(build_msg(MSG_STREAM, b"\x01"))
+        dev.write(
+            build_msg(
+                MSG_STREAM,
+                b"\x01",
+            )
+        )
 
-        # Confirm that actual IMU packets arrive.
+        # Confirm actual IMU packets arrive.
         end = time.monotonic() + 1.0
 
         while time.monotonic() < end:
@@ -578,18 +1006,172 @@ class ImuReader(threading.Thread):
 
             if dev:
                 self.dev = dev
+
                 print(
                     "[imu] stream open",
                     flush=True,
                 )
+
                 return
 
         raise RuntimeError(
-            "Xreal devices present but the IMU handshake got no data. "
-            "See the [imu] diagnostics above."
+            "Xreal devices present but the IMU handshake "
+            "got no data. See the [imu] diagnostics above."
         )
 
-    # -- lifecycle -----------------------------------------------------
+    # ------------------------------------------------------------------
+    # Calibration helpers
+    # ------------------------------------------------------------------
+
+    def _reset_calibration(self):
+        self._gyro_samples = []
+        self._accel_samples = []
+
+        self._calibrated = False
+        self._one_g = None
+
+        self._gyro_bias = [
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+    def _collect_calibration(self, s):
+        """
+        Collect startup stationary samples.
+
+        The glasses should be still during this phase.
+        """
+
+        gx = s["gx"] * GYRO_DPS_TO_RAD
+        gy = s["gy"] * GYRO_DPS_TO_RAD
+        gz = s["gz"] * GYRO_DPS_TO_RAD
+
+        an = math.sqrt(
+            s["ax"] ** 2
+            + s["ay"] ** 2
+            + s["az"] ** 2
+        )
+
+        self._gyro_samples.append(
+            (gx, gy, gz)
+        )
+
+        if an > 0.0:
+            self._accel_samples.append(an)
+
+        if (
+            len(self._gyro_samples)
+            < GYRO_CAL_SAMPLES
+        ):
+            return False
+
+        # Average gyro while stationary.
+        self._gyro_bias = [
+            sum(v[i] for v in self._gyro_samples)
+            / len(self._gyro_samples)
+            for i in range(3)
+        ]
+
+        # Average accelerometer magnitude.
+        if self._accel_samples:
+            self._one_g = (
+                sum(self._accel_samples)
+                / len(self._accel_samples)
+            )
+
+        if not self._one_g or self._one_g <= 1e-9:
+            self._one_g = 1.0
+
+        print(
+            "[imu] gyro bias = "
+            f"{self._gyro_bias[0] / GYRO_DPS_TO_RAD:.4f}, "
+            f"{self._gyro_bias[1] / GYRO_DPS_TO_RAD:.4f}, "
+            f"{self._gyro_bias[2] / GYRO_DPS_TO_RAD:.4f} dps",
+            flush=True,
+        )
+
+        print(
+            f"[imu] 1g reference = {self._one_g:.4f}",
+            flush=True,
+        )
+
+        self._calibrated = True
+
+        # Reset filter after calibration so the initial state starts
+        # cleanly rather than integrating calibration samples.
+        self.filter.reset()
+
+        self._reference_q = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+        self._display_q = [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+        print(
+            "[imu] calibration complete - hold still",
+            flush=True,
+        )
+
+        return True
+
+    def _accel_weight(self, acceleration):
+        """
+        Determine how trustworthy the accelerometer is as a gravity
+        reference.
+
+        Near 1g:
+            full correction.
+
+        During strong acceleration:
+            reduced correction.
+
+        This is important for a head-mounted device because moving
+        the glasses produces linear acceleration in addition to gravity.
+        """
+
+        if self._one_g is None:
+            return 1.0
+
+        ratio = acceleration / self._one_g
+
+        error = abs(ratio - 1.0)
+
+        if error <= (1.0 - ACCEL_FULL_WEIGHT):
+            return 1.0
+
+        if error >= (1.0 - ACCEL_ZERO_WEIGHT):
+            return ACCEL_ZERO_WEIGHT
+
+        # Smoothly transition between full and reduced correction.
+        x = (
+            error - (1.0 - ACCEL_FULL_WEIGHT)
+        ) / (
+            (1.0 - ACCEL_ZERO_WEIGHT)
+            - (1.0 - ACCEL_FULL_WEIGHT)
+        )
+
+        # Smoothstep.
+        x = x * x * (3.0 - 2.0 * x)
+
+        return (
+            1.0
+            + (
+                ACCEL_ZERO_WEIGHT - 1.0
+            ) * x
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def stop(self):
         self._stop.set()
@@ -597,11 +1179,28 @@ class ImuReader(threading.Thread):
     def recenter(self):
         self._recenter.set()
 
+    # ------------------------------------------------------------------
+    # Main sensor thread
+    # ------------------------------------------------------------------
+
     def run(self):
-        self.open()
+        try:
+            self.open()
+
+        except Exception as e:
+            print(
+                f"[imu] open failed: {e}",
+                flush=True,
+            )
+
+            self.state["ok"] = False
+            return
+
+        self._reset_calibration()
 
         last_ts = None
         last_wall = time.monotonic()
+
         count = 0
 
         while not self._stop.is_set():
@@ -613,6 +1212,8 @@ class ImuReader(threading.Thread):
                     f"[imu] read error: {e}",
                     flush=True,
                 )
+
+                self.state["ok"] = False
 
                 time.sleep(0.5)
                 continue
@@ -638,6 +1239,10 @@ class ImuReader(threading.Thread):
                 )
                 continue
 
+            # ----------------------------------------------------------
+            # Sensor timestamp
+            # ----------------------------------------------------------
+
             dt = 0.0
 
             if (
@@ -650,70 +1255,98 @@ class ImuReader(threading.Thread):
 
             last_ts = s["ts_ns"]
 
-            if dt <= 0 or dt > 0.05:
+            if dt <= 0.0 or dt > 0.05:
                 continue
 
-            gx, gy, gz = (
-                s[k] * self.GYRO_DPS_TO_RAD
-                for k in ("gx", "gy", "gz")
+            # ----------------------------------------------------------
+            # Startup calibration
+            # ----------------------------------------------------------
+
+            if not self._calibrated:
+                self._collect_calibration(s)
+
+                # Don't publish orientation until calibration is done.
+                self.state["ok"] = False
+
+                continue
+
+            # ----------------------------------------------------------
+            # Raw accelerometer
+            # ----------------------------------------------------------
+
+            ax = s["ax"]
+            ay = s["ay"]
+            az = s["az"]
+
+            acceleration = math.sqrt(
+                ax * ax
+                + ay * ay
+                + az * az
             )
+
+            # ----------------------------------------------------------
+            # Raw gyro, converted to rad/s and corrected for bias.
+            # ----------------------------------------------------------
+
+            gx = (
+                s["gx"] * GYRO_DPS_TO_RAD
+                - self._gyro_bias[0]
+            )
+
+            gy = (
+                s["gy"] * GYRO_DPS_TO_RAD
+                - self._gyro_bias[1]
+            )
+
+            gz = (
+                s["gz"] * GYRO_DPS_TO_RAD
+                - self._gyro_bias[2]
+            )
+
+            # ----------------------------------------------------------
+            # Adaptive gravity correction.
+            # ----------------------------------------------------------
+
+            accel_weight = self._accel_weight(
+                acceleration
+            )
+
+            # ----------------------------------------------------------
+            # Quaternion fusion.
+            # ----------------------------------------------------------
 
             self.filter.update(
                 gx,
                 gy,
                 gz,
-                s["ax"],
-                s["ay"],
-                s["az"],
+                ax,
+                ay,
+                az,
                 dt,
+                accel_weight,
             )
 
-            roll, pitch, yaw = euler_deg(
-                self.filter.q
-            )
+            q = self.filter.q
 
-            # Auto-calibrate 1g from first ~100 samples.
-            if self._one_g is None:
-                an = math.sqrt(
-                    s["ax"] ** 2
-                    + s["ay"] ** 2
-                    + s["az"] ** 2
-                )
-
-                if an > 0:
-                    self._rest_vals.append(an)
-
-                if len(self._rest_vals) >= 100:
-                    self._one_g = (
-                        sum(self._rest_vals)
-                        / len(self._rest_vals)
-                    )
-
-                    print(
-                        f"[imu] 1g reference = "
-                        f"{self._one_g:.3f}",
-                        flush=True,
-                    )
-
-                g_force = 1.0
-
-            else:
-                g_force = (
-                    math.sqrt(
-                        s["ax"] ** 2
-                        + s["ay"] ** 2
-                        + s["az"] ** 2
-                    )
-                    / self._one_g
-                )
+            # ----------------------------------------------------------
+            # Recenter.
+            #
+            # Store the entire quaternion. This avoids problems caused
+            # by independently subtracting Euler angles.
+            # ----------------------------------------------------------
 
             if self._recenter.is_set():
                 self._recenter.clear()
 
-                self._offsets = [
-                    roll,
-                    pitch,
-                    yaw,
+                self._reference_q = list(q)
+
+                # Reset display interpolation so recenter happens
+                # immediately rather than visibly easing through it.
+                self._display_q = [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
                 ]
 
                 print(
@@ -721,7 +1354,51 @@ class ImuReader(threading.Thread):
                     flush=True,
                 )
 
-            o_roll, o_pitch, o_yaw = self._offsets
+            # ----------------------------------------------------------
+            # Convert current orientation into the recentered frame.
+            # ----------------------------------------------------------
+
+            relative_q = quat_relative(
+                self._reference_q,
+                q,
+            )
+
+            # ----------------------------------------------------------
+            # Very light orientation smoothing.
+            #
+            # The HUD has its own stronger smoothing, so this only
+            # removes sensor-level single-frame noise.
+            # ----------------------------------------------------------
+
+            alpha = 1.0 - math.exp(
+                -dt / ORIENTATION_SMOOTH_TAU
+            )
+
+            self._display_q = quat_slerp(
+                self._display_q,
+                relative_q,
+                alpha,
+            )
+
+            roll, pitch, yaw = quaternion_to_euler(
+                self._display_q
+            )
+
+            # ----------------------------------------------------------
+            # G meter.
+            # ----------------------------------------------------------
+
+            if self._one_g:
+                g_force = (
+                    acceleration
+                    / self._one_g
+                )
+            else:
+                g_force = 1.0
+
+            # ----------------------------------------------------------
+            # Update rate.
+            # ----------------------------------------------------------
 
             now = time.monotonic()
 
@@ -735,16 +1412,28 @@ class ImuReader(threading.Thread):
                 count = 0
                 last_wall = now
 
+            # ----------------------------------------------------------
+            # Publish.
+            # ----------------------------------------------------------
+
             self.state.update(
                 ok=True,
-                bank=roll - o_roll,
-                pitch=pitch - o_pitch,
-                yaw=(yaw - o_yaw + 180) % 360 - 180,
+                bank=roll,
+                pitch=pitch,
+                yaw=yaw,
                 g=g_force,
                 temp_c=s["temp_c"],
             )
 
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
     def close(self):
+        self.state["ok"] = False
+
         if self.dev:
             try:
                 self.dev.write(
@@ -753,18 +1442,25 @@ class ImuReader(threading.Thread):
                         b"\x00",
                     )
                 )
+
             except Exception:
                 pass
 
             try:
                 self.dev.close()
+
             except Exception:
                 pass
 
+            self.dev = None
 
-# ------------------------------------------------------------------- main
+
+# ---------------------------------------------------------------------------
+# Standalone test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+
     if "--dump" in sys.argv:
         r = ImuReader(dump=True)
 
