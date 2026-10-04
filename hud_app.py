@@ -5,7 +5,7 @@ xreal-hud - native fullscreen HUD app for the Xreal Air / Steam Deck.
 Controls:
     c / gamepad-A = recenter
     u / gamepad-Y = mph / kmh
-    m / gamepad-X = menu
+    m             = menu
     b / gamepad-B = quit
     esc           = quit
 """
@@ -688,36 +688,16 @@ class Hud:
 
         # -------------------------------------------------------------------
         # Attitude ladder
-        #
-        # The ladder is rendered WITHOUT alpha.
-        #
-        # Instead, each rung's colour is pre-blended against the black HUD
-        # background. This makes the ladder fully opaque from Pygame's point
-        # of view and avoids alpha/smoothscale issues on the Xreal display.
-        #
-        # Visual behaviour:
-        #
-        #   centre = 100% brightness
-        #   outer  = 25% brightness
-        #
-        # Colour:
-        #
-        #   centre -> CYAN
-        #   middle -> AMBER
-        #   outer  -> RED
         # -------------------------------------------------------------------
 
         ladder_surface = pygame.Surface(
             (
                 int(VW * k),
                 int(VH * k),
-        ))
+            )
+        )
 
         ladder_surface.fill(BG)
-
-        # Exactly 19 rungs:
-        #
-        #   -90 ... -10, 0, +10 ... +90
 
         for degrees in range(-90, 91, 10):
 
@@ -733,13 +713,6 @@ class Hud:
             ):
                 continue
 
-            # ---------------------------------------------------------------
-            # Distance from the visual centre.
-            #
-            # This keeps transparency/brightness centred on the actual HUD
-            # centre as the ladder moves with pitch.
-            # ---------------------------------------------------------------
-
             visual_distance = abs(y - CY)
 
             max_distance = (
@@ -751,17 +724,7 @@ class Hud:
                 visual_distance / max_distance,
             )
 
-            # ---------------------------------------------------------------
-            # Colour gradient:
-            #
-            # centre -> cyan
-            # middle -> amber
-            # outer  -> red
-            # ---------------------------------------------------------------
-
             if rung_distance <= 0.5:
-
-                # Cyan -> Amber
 
                 color_t = (
                     rung_distance / 0.5
@@ -780,8 +743,6 @@ class Hud:
 
             else:
 
-                # Amber -> Red
-
                 color_t = (
                     rung_distance - 0.5
                 ) / 0.5
@@ -796,21 +757,6 @@ class Hud:
                     )
                     for i in range(3)
                 )
-
-            # ---------------------------------------------------------------
-            # Brightness / transparency.
-            #
-            # We no longer use an alpha channel.
-            #
-            # Instead:
-            #
-            #   255 = full colour
-            #    64 = 25% colour
-            #
-            # Since BG is black, multiplying the colour by this factor gives
-            # exactly the same visual result as alpha compositing against
-            # black.
-            # ---------------------------------------------------------------
 
             brightness = (
                 1.0
@@ -830,20 +776,12 @@ class Hud:
                 for channel in rgb
             )
 
-            # ---------------------------------------------------------------
-            # Rung dimensions.
-            # ---------------------------------------------------------------
-
             if degrees == 0:
                 half = 110
                 line_width = lw2
             else:
                 half = 92
                 line_width = lw
-
-            # ---------------------------------------------------------------
-            # Rotate rung with current bank.
-            # ---------------------------------------------------------------
 
             x1, y1 = xf(
                 CX - half,
@@ -870,13 +808,6 @@ class Hud:
                 ),
                 line_width,
             )
-
-            # ---------------------------------------------------------------
-            # Inner segment.
-            #
-            # Previously this used alpha * 0.65. Since the ladder is now
-            # opaque, simply scale the already-computed RGB colour.
-            # ---------------------------------------------------------------
 
             inner_color = tuple(
                 int(channel * 0.65)
@@ -909,18 +840,10 @@ class Hud:
                 lw,
             )
 
-        # -------------------------------------------------------------------
-        # Composite ladder.
-        #
-        # There is NO alpha here. The ladder is already blended against
-        # black, so this is a normal opaque blit.
-        # -------------------------------------------------------------------
-
         surface.blit(
             ladder_surface,
             (0, 0),
         )
-
 
         # -------------------------------------------------------------------
         # Bank scale
@@ -1122,6 +1045,25 @@ class Hud:
         )
 
         # -------------------------------------------------------------------
+        # G-force - top left
+        # -------------------------------------------------------------------
+
+        g_value = float(
+            imu.get("g", 1.0)
+        )
+
+        self.text(
+            surface,
+            "G %.2f" % g_value,
+            AMBER,
+            20,
+            18,
+            18,
+            True,
+            "la",
+        )
+
+        # -------------------------------------------------------------------
         # Time / date
         # -------------------------------------------------------------------
 
@@ -1295,56 +1237,11 @@ class Hud:
             )
 
         # -------------------------------------------------------------------
-        # Orientation readout
+        # Menu
+        #
+        # M key still toggles this menu.
+        # The on-screen menu button has been removed.
         # -------------------------------------------------------------------
-
-        readout = (
-            "P %+d B %+d Y %03d G %.2f"
-            % (
-                round(sp),
-                round(sb),
-                int(round(sy)) % 360,
-                imu.get("g", 1.0),
-            )
-        )
-
-        self.text(
-            surface,
-            readout,
-            DIM,
-            CX,
-            VH - 18,
-            12,
-            False,
-            "ca",
-        )
-
-        # -------------------------------------------------------------------
-        # Menu button
-        # -------------------------------------------------------------------
-
-        pygame.draw.rect(
-            surface,
-            DIM,
-            (
-                20 * k,
-                16 * k,
-                40 * k,
-                40 * k,
-            ),
-            boldlw,
-            2,
-        )
-
-        for yy in (26, 36, 46):
-            line(
-                28,
-                yy,
-                52,
-                yy,
-                CYAN,
-                lw2,
-            )
 
         if self.menu:
             self.draw_menu(
@@ -1543,7 +1440,7 @@ class Hud:
 
         self.text(
             surface,
-            "x/m menu  b/esc quit",
+            "m menu  b/esc quit",
             DIM,
             x + 14,
             y + 146,
