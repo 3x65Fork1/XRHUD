@@ -600,7 +600,9 @@ class Hud:
 
         # -------------------------------------------------------------------
         # Smooth orientation.
-        # Pitch and bank deliberately swapped compated to the values published by imu.py.
+        #
+        # Pitch and bank deliberately swapped compared to the values
+        # published by imu.py.
         # -------------------------------------------------------------------
 
         pitch = float(
@@ -674,19 +676,37 @@ class Hud:
                 surface,
                 color,
                 (
-                    x1 * k,
-                    y1 * k,
+                    int(x1 * k),
+                    int(y1 * k),
                 ),
                 (
-                    x2 * k,
-                    y2 * k,
+                    int(x2 * k),
+                    int(y2 * k),
                 ),
                 width,
             )
 
-        # ---------------------------------------------------------------------------
+        # -------------------------------------------------------------------
         # Attitude ladder
-        # ---------------------------------------------------------------------------
+        #
+        # The rung is first transformed by bank/roll.  Fade is then based
+        # on the ACTUAL visual distance of the transformed rung from the
+        # HUD centre, rather than the rung's unrotated Y coordinate.
+        #
+        # This means the fading follows the rotated ladder correctly.
+        # -------------------------------------------------------------------
+
+        ladder_surface = pygame.Surface(
+            (
+                int(VW * k),
+                int(VH * k),
+            ),
+            pygame.SRCALPHA,
+        )
+
+        ladder_surface.fill(
+            (0, 0, 0, 0)
+        )
 
         for degrees in LADDER_DEGS:
             y = (
@@ -701,67 +721,14 @@ class Hud:
             ):
                 continue
 
-            # Distance from the HUD centre.
-            # Nearby rungs are bright; distant rungs fade toward transparent.
-            distance = abs(y - CY)
-
-            fade = max(
-                0.0,
-                min(
-                    1.0,
-                    distance / 150.0,
-                ),
-            )
-
-            # Opacity:
-            #   centre = 255
-            #   75 px  = ~128
-            #   150 px = ~25
-            alpha = int(
-                255 * (1.0 - fade)
-            )
-
-            alpha = max(
-                25,
-                min(255, alpha),
-            )
-
             if degrees == 0:
-                # Zero-degree rung stays cyan.
-                color = (
-                    CYAN[0],
-                    CYAN[1],
-                    CYAN[2],
-                    alpha,
-                )
-
-                line_width = lw2
                 half = 110
-
+                line_width = lw2
             else:
-                # Preserve the original cyan -> DIM colour gradient.
-                strength = 1.0 - fade * 0.70
-
-                color = (
-                    int(
-                        DIM[0]
-                        + (CYAN[0] - DIM[0]) * strength
-                    ),
-                    int(
-                        DIM[1]
-                        + (CYAN[1] - DIM[1]) * strength
-                    ),
-                    int(
-                        DIM[2]
-                        + (CYAN[2] - DIM[2]) * strength
-                    ),
-                    alpha,
-                )
-
-                line_width = lw
                 half = 92
+                line_width = lw
 
-            # Main rung.
+            # Transform the actual endpoints first.
             x1, y1 = xf(
                 CX - half,
                 y,
@@ -774,50 +741,141 @@ class Hud:
                 sb,
             )
 
-            line(
-                x1,
-                y1,
-                x2,
-                y2,
+            # Calculate the visual midpoint AFTER roll/bank.
+            midpoint_x = (
+                x1 + x2
+            ) * 0.5
+
+            midpoint_y = (
+                y1 + y2
+            ) * 0.5
+
+            # Actual visual distance from the HUD centre.
+            visual_distance = math.hypot(
+                midpoint_x - CX,
+                midpoint_y - CY,
+            )
+
+            # Fade based on actual screen-space distance.
+            #
+            # 0 px   -> 100% opacity
+            # 60 px  -> strong visibility
+            # 120 px -> significantly faded
+            # 180+px -> minimum visibility
+            fade_distance = 180.0
+
+            fade = max(
+                0.0,
+                min(
+                    1.0,
+                    visual_distance / fade_distance,
+                ),
+            )
+
+            # Non-linear curve:
+            # keeps nearby rungs readable while producing a more obvious
+            # fade farther away.
+            fade_curve = fade ** 1.35
+
+            opacity = int(
+                255 * (1.0 - fade_curve)
+            )
+
+            # Keep distant rungs barely visible rather than disappearing.
+            opacity = max(
+                20,
+                min(
+                    255,
+                    opacity,
+                ),
+            )
+
+            # Preserve the original cyan -> DIM colour behaviour.
+            if degrees == 0:
+                rgb = CYAN
+            else:
+                strength = 1.0 - fade * 0.70
+
+                rgb = tuple(
+                    int(
+                        DIM[i]
+                        + (
+                            CYAN[i]
+                            - DIM[i]
+                        ) * strength
+                    )
+                    for i in range(3)
+                )
+
+            color = (
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                opacity,
+            )
+
+            # Main rung.
+            pygame.draw.line(
+                ladder_surface,
                 color,
+                (
+                    int(x1 * k),
+                    int(y1 * k),
+                ),
+                (
+                    int(x2 * k),
+                    int(y2 * k),
+                ),
                 line_width,
             )
 
-            # Inner segment.
-            inner_alpha = max(
-                15,
-                int(alpha * 0.75),
+            # Inner reference segment.
+            inner_opacity = max(
+                10,
+                int(opacity * 0.65),
             )
 
             inner_color = (
                 DIM[0],
                 DIM[1],
                 DIM[2],
-                inner_alpha,
+                inner_opacity,
             )
 
-            x1, y1 = xf(
+            ix1, iy1 = xf(
                 CX - 32,
                 y,
                 sb,
             )
 
-            x2, y2 = xf(
+            ix2, iy2 = xf(
                 CX + 32,
                 y,
                 sb,
             )
 
-            line(
-                x1,
-                y1,
-                x2,
-                y2,
+            pygame.draw.line(
+                ladder_surface,
                 inner_color,
+                (
+                    int(ix1 * k),
+                    int(iy1 * k),
+                ),
+                (
+                    int(ix2 * k),
+                    int(iy2 * k),
+                ),
                 lw,
             )
 
-
+        # Composite the independently alpha-blended ladder onto the HUD.
+        surface.blit(
+            ladder_surface,
+            (
+                0,
+                0,
+            ),
+        )
 
         # -------------------------------------------------------------------
         # Bank scale
