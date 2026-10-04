@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-xreal-hud — self-contained native HUD app for the Xreal Air / Steam Deck.
+xreal-hud - self-contained native HUD app for the Xreal Air / Steam Deck.
 
 Single binary (pyinstaller), launched as a non-Steam game from gaming mode.
 Renders the fighter-jet HUD fullscreen; reads the glasses IMU directly over
 USB HID (imu.py), listens for phone GPS on UDP :8676.
+
+Axis mapping lives in imu.py (SWAP/INVERT config) - do NOT swap signs here.
 
 Controls:  c / gamepad-A = recenter    u / gamepad-Y = mph-kmh
            m / gamepad-X = menu        b / gamepad-B = quit
@@ -25,10 +27,8 @@ import pygame
 
 try:
     from imu import ImuReader
-    DEP_ERROR = None
-except Exception as e:
+except ImportError:
     ImuReader = None
-    DEP_ERROR = str(e)
 
 VW, VH = 640.0, 360.0          # logical HUD coordinate space (16:9)
 CX, CY = 320.0, 190.0
@@ -38,6 +38,25 @@ DIM = (138, 154, 165)
 BG = (0, 0, 0)
 RED = (255, 93, 93)
 GPS_STALE_S = 6.0
+
+# explicit paths: SysFont can return a broken font on bleeding-edge python
+# (text renders as solid rectangles). Loading the ttf directly avoids it.
+FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+)
+FONT_PATHS_BOLD = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+)
+
+
+def _find_font(bold):
+    for path in (FONT_PATHS_BOLD if bold else FONT_PATHS):
+        if os.path.exists(path):
+            return path
+    return None
 
 
 # --------------------------------------------------------------------- data
@@ -108,18 +127,21 @@ class ImuManager:
 
 # ---------------------------------------------------------------- geometry
 
-LADDER_DEGS = [-30, -20, -10, 0, 10, 20, 30]
+# Full attitude ladder: -180° through +180°.
+LADDER_DEGS = range(-180, 181, 10)
+
+# Logical pixels of ladder movement per degree of pitch.
+# 3 px/deg preserves the current visual scale.
+PITCH_PX_PER_DEG = 3.0
+
+# How far outside the display we'll bother transforming/drawing rungs.
+LADDER_MARGIN = 120.0
 
 
-def xf(x, y, pitch, bank):
-    # Convert pitch into a smooth, bounded screen displacement.
-    # Large IMU angles asymptotically approach the limit instead of snapping.
-    pitch_offset = 75.0 * math.tanh(pitch / 45.0)
-
-    y += pitch_offset
-
-    a = math.radians(bank)
-
+def xf(x, y, bank):
+    """World-fixed ladder transform: bank rotates the ladder.
+    Pitch translation is handled separately so the ladder can move freely."""
+    a = math.radians(-bank)
     dx, dy = x - CX, y - CY
     return (
         CX + dx * math.cos(a) - dy * math.sin(a),
@@ -151,7 +173,7 @@ BANK_TICKS = bank_ticks()
 # --------------------------------------------------------------------- app
 
 class Hud:
-    def __init__(self, demo=False, gps_port=8676):
+    def __init__(self, demo=False, gps_port=8676, debug=False):
         pygame.init()
         pygame.joystick.init()
         self.pads = []
@@ -166,18 +188,20 @@ class Hud:
         pygame.display.set_caption("xreal hud")
         pygame.mouse.set_visible(False)
 
-        self.SS = 2 if self.w >= 1920 else 1
-        self.ss = pygame.Surface((int(VW * 3), int(VH * 3)), pygame.SRCALPHA)
-        self.k = (VW * 3) / VW            # logical -> supersample px
+        self.k = 3.0                      # logical -> supersample px (1920x1080)
+        self.ss = pygame.Surface((int(VW * self.k), int(VH * self.k)), pygame.SRCALPHA)
 
         self.fonts = {}
         self.demo = demo
+        self.debug = debug
         self.gps = GpsListener(gps_port)
         self.gps.start()
         self.imu = None if demo else ImuManager()
-        self.menu = False                  # visible at start so controls are discoverable
+        self.menu = False                 # press m / gamepad-X to open
         self.unit = self._load_unit()
         self.smooth = {"pitch": 0.0, "bank": 0.0}
+        self.smooth_yaw = 0.0
+        self._last_t = time.monotonic()
         self.clock = pygame.time.Clock()
         self.t0 = time.monotonic()
 
@@ -200,11 +224,15 @@ class Hud:
 
     # -- text helper ---------------------------------------------------------
     def font(self, logical_px, bold=False):
-        px = int(logical_px * self.k * 0.72)
+        px = max(8, int(logical_px * self.k * 0.72))
         key = (px, bold)
         if key not in self.fonts:
-            self.fonts[key] = pygame.font.SysFont(["dejavusans", "liberationsans", None],
-                                                  px, bold=bold)
+            path = _find_font(bold)
+            try:
+                self.fonts[key] = (pygame.font.Font(path, px) if path
+                                   else pygame.font.Font(None, px))
+            except Exception:
+                self.fonts[key] = pygame.font.Font(None, px)
         return self.fonts[key]
 
     def text(self, s, txt, color, x, y, size=12, bold=False, anchor="la"):
@@ -277,41 +305,92 @@ class Hud:
         lw2 = max(3, int(2.4 * k))
         boldlw = max(2, int(1.2 * k))
 
-        pitch, bank = imu["bank"], imu["pitch"]
-
-        print(
-            f"RAW pitch={imu['pitch']:+8.2f} "
-            f"bank={imu['bank']:+8.2f} "
-            f"mapped pitch={pitch:+8.2f} "
-            f"bank={bank:+8.2f}",
-            flush=True,
-        )
-
-        self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * 0.6
-        self.smooth["bank"] += (bank - self.smooth["bank"]) * 0.6
-        sp, sb = self.smooth["pitch"], self.smooth["bank"]
+        # --- time-based smoothing (frame-rate independent) ---
+        pitch, bank, yaw = imu["pitch"], imu["bank"], imu.get("yaw", 0.0)
+        if self.debug:
+            print(f"pitch={pitch:.2f} bank={bank:.2f} yaw={yaw:.2f}", flush=True)
+        now = time.monotonic()
+        dt = min(now - self._last_t, 0.1)
+        self._last_t = now
+        a = 1.0 - math.exp(-dt * 10.0)    # ~100 ms time constant
+        self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * a
+        self.smooth["bank"] += (bank - self.smooth["bank"]) * a
+        dyaw = (yaw - self.smooth_yaw + 180.0) % 360.0 - 180.0   # shortest arc
+        self.smooth_yaw = (self.smooth_yaw + dyaw * a) % 360.0
+        sp, sb, sy = self.smooth["pitch"], self.smooth["bank"], self.smooth_yaw
 
         def L(x1, y1, x2, y2, color=CYAN, w=lw):
             pygame.draw.line(s, color, (x1 * k, y1 * k), (x2 * k, y2 * k), w)
 
-        # pitch ladder + bank marker
+# --- free-moving ±180° pitch ladder -------------------------------
+#
+# Pitch moves the entire ladder linearly. There is deliberately no
+# tanh()/clamp here, so the ladder can freely leave the display.
+#
+# sp = current smoothed aircraft pitch.
+# Positive pitch moves the ladder downward; negative pitch moves it up.
+
         for d in LADDER_DEGS:
-            y = CY - d * 3
-            half = 110 if d == 0 else 92
-            (x1, yy1), (x2, yy2) = xf(CX - half, y, sp, sb), xf(CX + half, y, sp, sb)
-            L(x1, yy1, x2, yy2, CYAN, lw2 if d == 0 else lw)
-            (x1, yy1), (x2, yy2) = xf(CX - 32, y, sp, sb), xf(CX + 32, y, sp, sb)
-            L(x1, yy1, x2, yy2, DIM, lw)
+            # World-space vertical position of this attitude rung.
+            y = CY - d * PITCH_PX_PER_DEG + sp * PITCH_PX_PER_DEG
+
+            # Skip rungs that are nowhere near the display.
+            if y < -LADDER_MARGIN or y > VH + LADDER_MARGIN:
+                continue
+
+            # Distance from the HUD center.
+            #
+            # 0.0 at the center -> full opacity
+            # 1.0 at the edge   -> minimum opacity
+            #
+            # The fade is deliberately smooth rather than linear.
+            dist = abs(y - CY)
+            fade = max(0.0, min(1.0, dist / (VH * 0.5)))
+
+            # Strong near center, progressively dimmer toward the edges.
+            strength = 1.0 - fade * 0.70
+
+            # Center rung remains bright and thick.
+            if d == 0:
+                color = tuple(int(c * strength) for c in CYAN)
+                line_width = lw2
+                half = 110
+            else:
+                # Secondary rungs fade toward DIM as they approach the edges.
+                base = tuple(
+                    int(DIM[i] + (CYAN[i] - DIM[i]) * strength)
+                    for i in range(3)
+                )
+                color = base
+                line_width = lw
+                half = 92
+
+            # Main attitude line.
+            (x1, yy1) = xf(CX - half, y, sb)
+            (x2, yy2) = xf(CX + half, y, sb)
+            L(x1, yy1, x2, yy2, color, line_width)
+
+            # Short inner reference marks.
+            inner_color = tuple(int(c * strength * 0.75) for c in DIM)
+
+            (x1, yy1) = xf(CX - 32, y, sb)
+            (x2, yy2) = xf(CX + 32, y, sb)
+            L(x1, yy1, x2, yy2, inner_color, lw)
         for (p1, p2) in BANK_TICKS:
             L(p1[0], p1[1], p2[0], p2[1], DIM, lw)
         tri = [rotp(320, 62, sb), rotp(312, 77, sb), rotp(328, 77, sb)]
         pygame.draw.polygon(s, AMBER, [(x * k, y * k) for x, y in tri])
 
-        # crosshair
+        # crosshair + heading arrow (amber, orbits the ring with yaw)
         pygame.draw.circle(s, AMBER, (int(CX * k), int(CY * k)), int(28 * k), lw2)
         L(CX, CY - 28, CX, CY - 14, AMBER, lw2)
         L(CX, CY + 14, CX, CY + 28, AMBER, lw2)
         pygame.draw.circle(s, AMBER, (int(CX * k), int(CY * k)), int(2.4 * k))
+        ar = math.radians(sy)
+        arrow = [(CX + 46 * math.sin(ar), CY - 46 * math.cos(ar)),
+                 (CX + 36 * math.sin(ar - 0.18), CY - 36 * math.cos(ar - 0.18)),
+                 (CX + 36 * math.sin(ar + 0.18), CY - 36 * math.cos(ar + 0.18))]
+        pygame.draw.polygon(s, AMBER, [(x * k, y * k) for x, y in arrow])
 
         # corner brackets
         m, c = 12, 30
@@ -321,9 +400,9 @@ class Hud:
         L(VW - m, VH - m, VW - m - c, VH - m, DIM, boldlw), L(VW - m, VH - m, VW - m, VH - m - c, DIM, boldlw)
 
         # time / date (top right)
-        now = datetime.now()
-        self.text(s, now.strftime("%H:%M:%S"), CYAN, VW - 20, 14, 30, True, "ra")
-        self.text(s, now.strftime("%a %d %b %Y").lower(), DIM, VW - 20, 48, 12, False, "ra")
+        now_dt = datetime.now()
+        self.text(s, now_dt.strftime("%H:%M:%S"), CYAN, VW - 20, 14, 30, True, "ra")
+        self.text(s, now_dt.strftime("%a %d %b %Y").lower(), DIM, VW - 20, 48, 12, False, "ra")
 
         # speed (bottom left)
         spd = "--"
@@ -336,35 +415,30 @@ class Hud:
         # gps (bottom right)
         if gps:
             self.text(s, "gps", DIM, VW - 20, VH - 66, 12, False, "ra")
-            self.text(s, "%.5f° %s" % (abs(gps["lat"]), "N" if gps["lat"] >= 0 else "S"),
+            self.text(s, "%.5f %s" % (abs(gps["lat"]), "N" if gps["lat"] >= 0 else "S"),
                       CYAN, VW - 20, VH - 52, 13, False, "ra")
-            self.text(s, "%.5f° %s" % (abs(gps["lon"]), "E" if gps["lon"] >= 0 else "W"),
+            self.text(s, "%.5f %s" % (abs(gps["lon"]), "E" if gps["lon"] >= 0 else "W"),
                       CYAN, VW - 20, VH - 34, 13, False, "ra")
-            self.text(s, "%d sats · hdop %s" % (gps.get("sats", 0), gps.get("hdop", "-")),
+            self.text(s, "%d sats - hdop %s" % (gps.get("sats", 0), gps.get("hdop", "-")),
                       DIM, VW - 20, VH - 16, 12, False, "ra")
         else:
             self.text(s, "gps", DIM, VW - 20, VH - 40, 12, False, "ra")
             self.text(s, "awaiting phone link", DIM, VW - 20, VH - 24, 12, False, "ra")
 
         # bottom center readouts
-        yaw = ((imu.get("yaw", 0) % 360) + 360) % 360
-        mid = ("P %+d B %+d Y %+d" %
-       (round(imu.get("pitch", 0)),
-        round(imu.get("bank", 0)),
-        round(imu.get("yaw", 0))))
+        mid = ("P %+d B %+d Y %03d G %.2f" %
+               (round(sp), round(sb), int(round(sy)) % 360, imu.get("g", 1.0)))
         self.text(s, mid, DIM, CX, VH - 18, 12, False, "ca")
 
         # menu button (top left)
         pygame.draw.rect(s, DIM, (20 * k, 16 * k, 40 * k, 40 * k), boldlw, 2)
-        for i, yy in enumerate((26, 36, 46)):
+        for yy in (26, 36, 46):
             L(28, yy, 52, yy, CYAN, lw2)
 
         if self.menu:
             self.draw_menu(s, imu, gps, gps_age)
 
-        if DEP_ERROR:
-            self.text(s, DEP_ERROR, RED, CX, 170, 14, False, "ca")
-        elif not imu.get("ok"):
+        if not imu.get("ok"):
             self.text(s, "awaiting glasses link", DIM, CX, 170, 15, False, "ca")
 
         pygame.transform.smoothscale(self.ss, (self.w, self.h), self.screen)
@@ -405,9 +479,10 @@ class Hud:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true", help="synthetic data, no glasses")
+    ap.add_argument("--debug", action="store_true", help="print pitch/bank/yaw at 60hz")
     ap.add_argument("--gps-port", type=int, default=8676)
     args = ap.parse_args()
-    Hud(demo=args.demo, gps_port=args.gps_port).run()
+    Hud(demo=args.demo, gps_port=args.gps_port, debug=args.debug).run()
 
 
 if __name__ == "__main__":
