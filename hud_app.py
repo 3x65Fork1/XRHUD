@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-xreal-hud - self-contained native HUD app for the Xreal Air / Steam Deck.
+xreal-hud - native fullscreen HUD app for the Xreal Air / Steam Deck.
 
-Single binary (pyinstaller), launched as a non-Steam game from gaming mode.
-Renders the fighter-jet HUD fullscreen; reads the glasses IMU directly over
-USB HID (imu.py), listens for phone GPS on UDP :8676.
-
-Axis mapping lives in imu.py (SWAP/INVERT config) - do NOT swap signs here.
-
-Controls:  c / gamepad-A = recenter    u / gamepad-Y = mph-kmh
-           m / gamepad-X = menu        b / gamepad-B = quit
-           esc = quit
+Controls:
+    c / gamepad-A = recenter
+    u / gamepad-Y = mph / kmh
+    m / gamepad-X = menu
+    b / gamepad-B = quit
+    esc           = quit
 """
 
 import argparse
@@ -18,7 +15,6 @@ import json
 import math
 import os
 import socket
-import sys
 import threading
 import time
 from datetime import datetime
@@ -30,45 +26,72 @@ try:
 except ImportError:
     ImuReader = None
 
-VW, VH = 640.0, 360.0          # logical HUD coordinate space (16:9)
+
+# ---------------------------------------------------------------------------
+# HUD configuration
+# ---------------------------------------------------------------------------
+
+VW, VH = 640.0, 360.0
 CX, CY = 320.0, 190.0
+
 CYAN = (63, 217, 255)
 AMBER = (255, 179, 64)
 DIM = (138, 154, 165)
-BG = (0, 0, 0)
 RED = (255, 93, 93)
+BG = (0, 0, 0)
+
 GPS_STALE_S = 6.0
 
-# explicit paths: SysFont can return a broken font on bleeding-edge python
-# (text renders as solid rectangles). Loading the ttf directly avoids it.
+LADDER_DEGS = range(-180, 181, 10)
+PITCH_PX_PER_DEG = 3.0
+LADDER_MARGIN = 120.0
+
 FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 )
+
 FONT_PATHS_BOLD = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 )
 
 
-def _find_font(bold):
-    for path in (FONT_PATHS_BOLD if bold else FONT_PATHS):
+def _find_font(bold=False):
+    paths = FONT_PATHS_BOLD if bold else FONT_PATHS
+
+    for path in paths:
         if os.path.exists(path):
             return path
+
     return None
 
 
-# --------------------------------------------------------------------- data
+# ---------------------------------------------------------------------------
+# GPS
+# ---------------------------------------------------------------------------
 
 class GpsListener(threading.Thread):
-    """Phone GPS arrives as UDP JSON: {"lat","lon","speed","sats","hdop"}."""
+    """Receive phone GPS as UDP JSON."""
 
     def __init__(self, port):
         super().__init__(daemon=True)
-        self.data, self.t = None, 0.0
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        self.data = None
+        self.t = 0.0
+
+        self.sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+        )
+
+        self.sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1,
+        )
+
         self.sock.bind(("0.0.0.0", port))
         self.sock.settimeout(1.0)
 
@@ -76,413 +99,1387 @@ class GpsListener(threading.Thread):
         while True:
             try:
                 raw, _ = self.sock.recvfrom(2048)
-                self.data = json.loads(raw.decode("utf-8", "replace"))
+
+                self.data = json.loads(
+                    raw.decode("utf-8", "replace")
+                )
+
                 self.t = time.monotonic()
+
             except socket.timeout:
                 continue
+
             except Exception:
                 time.sleep(1.0)
 
 
+# ---------------------------------------------------------------------------
+# IMU manager
+# ---------------------------------------------------------------------------
+
 class ImuManager:
-    """Creates an ImuReader once the glasses answer; retries until then."""
+    """
+    Keep an ImuReader alive and automatically reconnect if the glasses
+    disappear and reappear.
+    """
 
     def __init__(self):
         self.reader = None
-        self.thread = threading.Thread(target=self._work, daemon=True)
+
+        self.thread = threading.Thread(
+            target=self._work,
+            daemon=True,
+        )
+
         self.thread.start()
 
     def _work(self):
         while True:
             if ImuReader is None:
-                print("[hud] imu.py unavailable", flush=True)
-                time.sleep(3)
+                print(
+                    "[hud] imu.py unavailable",
+                    flush=True,
+                )
+
+                time.sleep(3.0)
                 continue
-            r = ImuReader()
-            r.start()
-            deadline = time.monotonic() + 5.0
-            while r.is_alive() and not r.state.get("ok") and time.monotonic() < deadline:
-                time.sleep(0.25)
-            if r.state.get("ok"):
-                print("[hud] imu stream live", flush=True)
-                self.reader = r
-                r.join()          # runs until stop() or error
-            else:
-                r.stop()
+
+            try:
+                reader = ImuReader()
+                reader.start()
+
+                deadline = time.monotonic() + 5.0
+
+                while (
+                    reader.is_alive()
+                    and not reader.state.get("ok")
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+
+                if reader.state.get("ok"):
+                    print(
+                        "[hud] imu stream live",
+                        flush=True,
+                    )
+
+                    self.reader = reader
+                    reader.join()
+
+                else:
+                    reader.stop()
+
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+
+                    time.sleep(2.0)
+
+            except Exception as exc:
+                print(
+                    f"[hud] imu error: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
                 time.sleep(2.0)
+
             self.reader = None
-            print("[hud] imu lost - retrying", flush=True)
+
+            print(
+                "[hud] imu lost - retrying",
+                flush=True,
+            )
 
     @property
     def state(self):
         if self.reader is not None:
             return self.reader.state
-        return {"ok": False, "hz": 0.0, "pitch": 0.0, "bank": 0.0,
-                "yaw": 0.0, "g": 1.0}
+
+        return {
+            "ok": False,
+            "hz": 0.0,
+            "pitch": 0.0,
+            "bank": 0.0,
+            "yaw": 0.0,
+            "g": 1.0,
+        }
 
     def recenter(self):
         if self.reader is not None:
             self.reader.recenter()
 
 
-# ---------------------------------------------------------------- geometry
-
-# Full attitude ladder: -180° through +180°.
-LADDER_DEGS = range(-180, 181, 10)
-
-# Logical pixels of ladder movement per degree of pitch.
-# 3 px/deg preserves the current visual scale.
-PITCH_PX_PER_DEG = 3.0
-
-# How far outside the display we'll bother transforming/drawing rungs.
-LADDER_MARGIN = 120.0
-
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
 
 def xf(x, y, bank):
-    """World-fixed ladder transform: bank rotates the ladder.
-    Pitch translation is handled separately so the ladder can move freely."""
-    a = math.radians(-bank)
-    dx, dy = x - CX, y - CY
+    """
+    Rotate a HUD point around the center by the current bank angle.
+    """
+
+    angle = math.radians(-bank)
+
+    dx = x - CX
+    dy = y - CY
+
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
     return (
-        CX + dx * math.cos(a) - dy * math.sin(a),
-        CY + dx * math.sin(a) + dy * math.cos(a),
+        CX + dx * cos_a - dy * sin_a,
+        CY + dx * sin_a + dy * cos_a,
     )
 
 
-def rotp(x, y, deg):
-    a = math.radians(deg)
-    dx, dy = x - CX, y - CY
-    return (CX + dx * math.cos(a) - dy * math.sin(a),
-            CY + dx * math.sin(a) + dy * math.cos(a))
+def rotp(x, y, degrees):
+    """Rotate a HUD point around the center."""
+
+    angle = math.radians(degrees)
+
+    dx = x - CX
+    dy = y - CY
+
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    return (
+        CX + dx * cos_a - dy * sin_a,
+        CY + dx * sin_a + dy * cos_a,
+    )
 
 
 def bank_ticks():
-    segs = []
-    for b in range(-60, 61, 10):
-        a = math.radians(270 + b)
+    segments = []
+
+    for bank in range(-60, 61, 10):
+        angle = math.radians(270 + bank)
+
         r1 = 102.0
-        r2 = 118.0 if b % 30 == 0 else 109.0
-        segs.append(((CX + r1 * math.cos(a), CY + r1 * math.sin(a)),
-                     (CX + r2 * math.cos(a), CY + r2 * math.sin(a))))
-    return segs
+
+        if bank % 30 == 0:
+            r2 = 118.0
+        else:
+            r2 = 109.0
+
+        segments.append(
+            (
+                (
+                    CX + r1 * math.cos(angle),
+                    CY + r1 * math.sin(angle),
+                ),
+                (
+                    CX + r2 * math.cos(angle),
+                    CY + r2 * math.sin(angle),
+                ),
+            )
+        )
+
+    return segments
 
 
 BANK_TICKS = bank_ticks()
 
 
-# --------------------------------------------------------------------- app
+# ---------------------------------------------------------------------------
+# HUD
+# ---------------------------------------------------------------------------
 
 class Hud:
-    def __init__(self, demo=False, gps_port=8676, debug=False):
+    def __init__(
+        self,
+        demo=False,
+        gps_port=8676,
+        debug=False,
+    ):
         pygame.init()
         pygame.joystick.init()
+
         self.pads = []
+
         for i in range(pygame.joystick.get_count()):
-            j = pygame.joystick.Joystick(i)
-            j.init()
-            self.pads.append(j)
+            joystick = pygame.joystick.Joystick(i)
+            joystick.init()
+            self.pads.append(joystick)
 
         info = pygame.display.Info()
-        self.w, self.h = info.current_w, info.current_h
-        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN | pygame.NOFRAME)
+
+        self.w = info.current_w
+        self.h = info.current_h
+
+        self.screen = pygame.display.set_mode(
+            (0, 0),
+            pygame.FULLSCREEN | pygame.NOFRAME,
+        )
+
         pygame.display.set_caption("xreal hud")
         pygame.mouse.set_visible(False)
 
-        self.k = 3.0                      # logical -> supersample px (1920x1080)
-        self.ss = pygame.Surface((int(VW * self.k), int(VH * self.k)), pygame.SRCALPHA)
+        self.k = 3.0
+
+        self.ss = pygame.Surface(
+            (
+                int(VW * self.k),
+                int(VH * self.k),
+            ),
+            pygame.SRCALPHA,
+        )
 
         self.fonts = {}
+
         self.demo = demo
         self.debug = debug
+
         self.gps = GpsListener(gps_port)
         self.gps.start()
-        self.imu = None if demo else ImuManager()
-        self.menu = False                 # press m / gamepad-X to open
+
+        if self.demo:
+            self.imu = None
+        else:
+            self.imu = ImuManager()
+
+        self.menu = False
+
         self.unit = self._load_unit()
-        self.smooth = {"pitch": 0.0, "bank": 0.0}
+
+        self.smooth_pitch = 0.0
+        self.smooth_bank = 0.0
         self.smooth_yaw = 0.0
+
         self._last_t = time.monotonic()
+
         self.clock = pygame.time.Clock()
         self.t0 = time.monotonic()
 
-    # -- tiny prefs --------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Preferences
+    # -----------------------------------------------------------------------
+
     def _cfg(self):
-        return os.path.expanduser("~/.config/xreal-hud/unit")
+        return os.path.expanduser(
+            "~/.config/xreal-hud/unit"
+        )
 
     def _load_unit(self):
         try:
-            return open(self._cfg()).read().strip() or "mph"
+            with open(self._cfg(), "r") as f:
+                value = f.read().strip()
+
+            return value or "mph"
+
         except Exception:
             return "mph"
 
     def _save_unit(self):
         try:
-            os.makedirs(os.path.dirname(self._cfg()), exist_ok=True)
-            open(self._cfg(), "w").write(self.unit)
+            path = self._cfg()
+
+            os.makedirs(
+                os.path.dirname(path),
+                exist_ok=True,
+            )
+
+            with open(path, "w") as f:
+                f.write(self.unit)
+
         except Exception:
             pass
 
-    # -- text helper ---------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Text
+    # -----------------------------------------------------------------------
+
     def font(self, logical_px, bold=False):
-        px = max(8, int(logical_px * self.k * 0.72))
+        px = max(
+            8,
+            int(logical_px * self.k * 0.72),
+        )
+
         key = (px, bold)
+
         if key not in self.fonts:
             path = _find_font(bold)
+
             try:
-                self.fonts[key] = (pygame.font.Font(path, px) if path
-                                   else pygame.font.Font(None, px))
+                if path:
+                    self.fonts[key] = pygame.font.Font(
+                        path,
+                        px,
+                    )
+                else:
+                    self.fonts[key] = pygame.font.Font(
+                        None,
+                        px,
+                    )
+
             except Exception:
-                self.fonts[key] = pygame.font.Font(None, px)
+                self.fonts[key] = pygame.font.Font(
+                    None,
+                    px,
+                )
+
         return self.fonts[key]
 
-    def text(self, s, txt, color, x, y, size=12, bold=False, anchor="la"):
-        surf = self.font(size, bold).render(txt, True, color)
-        rect = surf.get_rect()
-        if anchor[0] == "r":
-            rect.topright = (int(x * self.k), int(y * self.k))
-        elif anchor[0] == "c":
-            rect.midtop = (int(x * self.k), int(y * self.k))
-        else:
-            rect.topleft = (int(x * self.k), int(y * self.k))
-        s.blit(surf, rect)
+    def text(
+        self,
+        surface,
+        txt,
+        color,
+        x,
+        y,
+        size=12,
+        bold=False,
+        anchor="la",
+    ):
+        rendered = self.font(
+            size,
+            bold,
+        ).render(
+            txt,
+            True,
+            color,
+        )
 
-    # -- input ----------------------------------------------------------------
-    def handle(self, ev, imu):
-        if ev.type == pygame.QUIT:
+        rect = rendered.get_rect()
+
+        if anchor[0] == "r":
+            rect.topright = (
+                int(x * self.k),
+                int(y * self.k),
+            )
+
+        elif anchor[0] == "c":
+            rect.midtop = (
+                int(x * self.k),
+                int(y * self.k),
+            )
+
+        else:
+            rect.topleft = (
+                int(x * self.k),
+                int(y * self.k),
+            )
+
+        surface.blit(
+            rendered,
+            rect,
+        )
+
+    # -----------------------------------------------------------------------
+    # Input
+    # -----------------------------------------------------------------------
+
+    def handle(self, event, imu):
+        if event.type == pygame.QUIT:
             return False
-        if ev.type == pygame.KEYDOWN:
-            if ev.key == pygame.K_ESCAPE:
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
                 return False
-            if ev.key == pygame.K_c:
+
+            if event.key == pygame.K_c:
                 imu.recenter()
-            elif ev.key == pygame.K_u:
-                self.unit = "kmh" if self.unit == "mph" else "mph"
+
+            elif event.key == pygame.K_u:
+                self.unit = (
+                    "kmh"
+                    if self.unit == "mph"
+                    else "mph"
+                )
+
                 self._save_unit()
-            elif ev.key == pygame.K_m:
+
+            elif event.key == pygame.K_m:
                 self.menu = not self.menu
-        if ev.type == pygame.JOYBUTTONDOWN:
-            b = ev.button
-            if b in (1,):
+
+        elif event.type == pygame.JOYBUTTONDOWN:
+            button = event.button
+
+            if button == 1:
                 return False
-            if b in (0,):
+
+            if button == 0:
                 imu.recenter()
-            elif b in (3,):
-                self.unit = "kmh" if self.unit == "mph" else "mph"
+
+            elif button == 3:
+                self.unit = (
+                    "kmh"
+                    if self.unit == "mph"
+                    else "mph"
+                )
+
                 self._save_unit()
-            elif b in (2, 7):
+
+            elif button in (2, 7):
                 self.menu = not self.menu
+
         return True
 
-    # -- frame ----------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # IMU
+    # -----------------------------------------------------------------------
+
     def imu_state(self, t):
         if self.demo:
-            return {"ok": True, "hz": 60.0,
-                    "pitch": math.sin(t / 2.1) * 9.0,
-                    "bank": math.sin(t / 1.3) * 22.0,
-                    "yaw": math.sin(t / 3.7) * 40.0,
-                    "g": 1.0 + math.sin(t / 0.9) * 0.12}
+            return {
+                "ok": True,
+                "hz": 60.0,
+                "pitch": math.sin(t / 2.1) * 9.0,
+                "bank": math.sin(t / 1.3) * 22.0,
+                "yaw": math.sin(t / 3.7) * 40.0,
+                "g": 1.0 + math.sin(t / 0.9) * 0.12,
+            }
+
         return self.imu.state
 
+    # -----------------------------------------------------------------------
+    # Demo GPS
+    # -----------------------------------------------------------------------
+
     def demo_gps(self, t):
-        return {"lat": 37.7749 + math.sin(t / 60) * 0.001,
-                "lon": -122.4194 + math.cos(t / 60) * 0.001,
-                "speed": 24.6 + math.sin(t / 4) * 3.0,
-                "sats": 14, "hdop": 0.8}
+        return {
+            "lat": 37.7749 + math.sin(t / 60.0) * 0.001,
+            "lon": -122.4194 + math.cos(t / 60.0) * 0.001,
+            "speed": 24.6 + math.sin(t / 4.0) * 3.0,
+            "sats": 14,
+            "hdop": 0.8,
+        }
+
+    # -----------------------------------------------------------------------
+    # Drawing
+    # -----------------------------------------------------------------------
 
     def draw(self):
         t = time.monotonic() - self.t0
+
         imu = self.imu_state(t)
-        gps = self.demo_gps(t) if self.demo else self.gps.data
-        gps_age = None if self.demo else (time.monotonic() - self.gps.t)
-        if not self.demo and (gps is None or gps_age > GPS_STALE_S):
-            gps = None
 
-        s = self.ss
-        s.fill((0, 0, 0, 0))
+        if self.demo:
+            gps = self.demo_gps(t)
+            gps_age = None
+        else:
+            gps = self.gps.data
+            gps_age = (
+                time.monotonic() - self.gps.t
+                if self.gps.t
+                else None
+            )
+
+            if (
+                gps is None
+                or gps_age is None
+                or gps_age > GPS_STALE_S
+            ):
+                gps = None
+
+        surface = self.ss
+
+        surface.fill(
+            (0, 0, 0, 0)
+        )
+
         self.screen.fill(BG)
+
         k = self.k
-        lw = max(2, int(1.6 * k))         # hairline on the microdisplay
-        lw2 = max(3, int(2.4 * k))
-        boldlw = max(2, int(1.2 * k))
 
-        # --- time-based smoothing (frame-rate independent) ---
-        pitch, bank, yaw = imu["bank"], imu["pitch"], imu.get("yaw", 0.0)
-        if self.debug:
-            print(f"pitch={pitch:.2f} bank={bank:.2f} yaw={yaw:.2f}", flush=True)
+        lw = max(
+            2,
+            int(1.6 * k),
+        )
+
+        lw2 = max(
+            3,
+            int(2.4 * k),
+        )
+
+        boldlw = max(
+            2,
+            int(1.2 * k),
+        )
+
+        # -------------------------------------------------------------------
+        # Smooth orientation.
+        #
+        # Pitch and bank deliberately use the values published by imu.py
+        # without changing their meaning or swapping them here.
+        # -------------------------------------------------------------------
+
+        pitch = float(
+            imu.get("pitch", 0.0)
+        )
+
+        bank = float(
+            imu.get("bank", 0.0)
+        )
+
+        yaw = float(
+            imu.get("yaw", 0.0)
+        )
+
         now = time.monotonic()
-        dt = min(now - self._last_t, 0.1)
+
+        dt = min(
+            now - self._last_t,
+            0.1,
+        )
+
         self._last_t = now
-        a = 1.0 - math.exp(-dt * 10.0)    # ~100 ms time constant
-        self.smooth["pitch"] += (pitch - self.smooth["pitch"]) * a
-        self.smooth["bank"] += (bank - self.smooth["bank"]) * a
-        dyaw = (yaw - self.smooth_yaw + 180.0) % 360.0 - 180.0   # shortest arc
-        self.smooth_yaw = (self.smooth_yaw + dyaw * a) % 360.0
-        sp, sb, sy = self.smooth["pitch"], self.smooth["bank"], self.smooth_yaw
 
-        def L(x1, y1, x2, y2, color=CYAN, w=lw):
-            pygame.draw.line(s, color, (x1 * k, y1 * k), (x2 * k, y2 * k), w)
+        alpha = 1.0 - math.exp(
+            -dt * 10.0
+        )
 
-# --- free-moving ±180° pitch ladder -------------------------------
-#
-# Pitch moves the entire ladder linearly. There is deliberately no
-# tanh()/clamp here, so the ladder can freely leave the display.
-#
-# sp = current smoothed aircraft pitch.
-# Positive pitch moves the ladder downward; negative pitch moves it up.
+        self.smooth_pitch += (
+            pitch - self.smooth_pitch
+        ) * alpha
 
-        for d in LADDER_DEGS:
-            # World-space vertical position of this attitude rung.
-            y = CY - d * PITCH_PX_PER_DEG + sp * PITCH_PX_PER_DEG
+        self.smooth_bank += (
+            bank - self.smooth_bank
+        ) * alpha
 
-            # Skip rungs that are nowhere near the display.
-            if y < -LADDER_MARGIN or y > VH + LADDER_MARGIN:
+        yaw_delta = (
+            yaw
+            - self.smooth_yaw
+            + 180.0
+        ) % 360.0 - 180.0
+
+        self.smooth_yaw = (
+            self.smooth_yaw
+            + yaw_delta * alpha
+        ) % 360.0
+
+        sp = self.smooth_pitch
+        sb = self.smooth_bank
+        sy = self.smooth_yaw
+
+        if self.debug:
+            print(
+                "pitch=%.2f bank=%.2f yaw=%.2f"
+                % (sp, sb, sy),
+                flush=True,
+            )
+
+        # -------------------------------------------------------------------
+        # Line helper
+        # -------------------------------------------------------------------
+
+        def line(
+            x1,
+            y1,
+            x2,
+            y2,
+            color=CYAN,
+            width=lw,
+        ):
+            pygame.draw.line(
+                surface,
+                color,
+                (
+                    x1 * k,
+                    y1 * k,
+                ),
+                (
+                    x2 * k,
+                    y2 * k,
+                ),
+                width,
+            )
+
+        # -------------------------------------------------------------------
+        # Attitude ladder
+        # -------------------------------------------------------------------
+
+        for degrees in LADDER_DEGS:
+            y = (
+                CY
+                - degrees * PITCH_PX_PER_DEG
+                + sp * PITCH_PX_PER_DEG
+            )
+
+            if (
+                y < -LADDER_MARGIN
+                or y > VH + LADDER_MARGIN
+            ):
                 continue
 
-            # Distance from the HUD center.
-            #
-            # 0.0 at the center -> full opacity
-            # 1.0 at the edge   -> minimum opacity
-            #
-            # The fade is deliberately smooth rather than linear.
-            dist = abs(y - CY)
-            fade = max(0.0, min(1.0, dist / (VH * 0.5)))
+            distance = abs(y - CY)
 
-            # Strong near center, progressively dimmer toward the edges.
-            strength = 1.0 - fade * 0.70
+            fade = max(
+                0.0,
+                min(
+                    1.0,
+                    distance / (VH * 0.5),
+                ),
+            )
 
-            # Center rung remains bright and thick.
-            if d == 0:
-                color = tuple(int(c * strength) for c in CYAN)
+            strength = (
+                1.0
+                - fade * 0.70
+            )
+
+            if degrees == 0:
+                color = tuple(
+                    int(c * strength)
+                    for c in CYAN
+                )
+
                 line_width = lw2
                 half = 110
+
             else:
-                # Secondary rungs fade toward DIM as they approach the edges.
-                base = tuple(
-                    int(DIM[i] + (CYAN[i] - DIM[i]) * strength)
+                color = tuple(
+                    int(
+                        DIM[i]
+                        + (
+                            CYAN[i]
+                            - DIM[i]
+                        ) * strength
+                    )
                     for i in range(3)
                 )
-                color = base
+
                 line_width = lw
                 half = 92
 
-            # Main attitude line.
-            (x1, yy1) = xf(CX - half, y, sb)
-            (x2, yy2) = xf(CX + half, y, sb)
-            L(x1, yy1, x2, yy2, color, line_width)
+            x1, y1 = xf(
+                CX - half,
+                y,
+                sb,
+            )
 
-            # Short inner reference marks.
-            inner_color = tuple(int(c * strength * 0.75) for c in DIM)
+            x2, y2 = xf(
+                CX + half,
+                y,
+                sb,
+            )
 
-            (x1, yy1) = xf(CX - 32, y, sb)
-            (x2, yy2) = xf(CX + 32, y, sb)
-            L(x1, yy1, x2, yy2, inner_color, lw)
-        for (p1, p2) in BANK_TICKS:
-            L(p1[0], p1[1], p2[0], p2[1], DIM, lw)
-        tri = [rotp(320, 62, sb), rotp(312, 77, sb), rotp(328, 77, sb)]
-        pygame.draw.polygon(s, AMBER, [(x * k, y * k) for x, y in tri])
+            line(
+                x1,
+                y1,
+                x2,
+                y2,
+                color,
+                line_width,
+            )
 
-        # crosshair + heading arrow (amber, orbits the ring with yaw)
-        pygame.draw.circle(s, AMBER, (int(CX * k), int(CY * k)), int(28 * k), lw2)
-        L(CX, CY - 28, CX, CY - 14, AMBER, lw2)
-        L(CX, CY + 14, CX, CY + 28, AMBER, lw2)
-        pygame.draw.circle(s, AMBER, (int(CX * k), int(CY * k)), int(2.4 * k))
-        ar = math.radians(sy)
-        arrow = [(CX + 46 * math.sin(ar), CY - 46 * math.cos(ar)),
-                 (CX + 36 * math.sin(ar - 0.18), CY - 36 * math.cos(ar - 0.18)),
-                 (CX + 36 * math.sin(ar + 0.18), CY - 36 * math.cos(ar + 0.18))]
-        pygame.draw.polygon(s, AMBER, [(x * k, y * k) for x, y in arrow])
+            inner_color = tuple(
+                int(c * strength * 0.75)
+                for c in DIM
+            )
 
-        # corner brackets
-        m, c = 12, 30
-        L(m, m, m + c, m, DIM, boldlw), L(m, m, m, m + c, DIM, boldlw)
-        L(VW - m, m, VW - m - c, m, DIM, boldlw), L(VW - m, m, VW - m, m + c, DIM, boldlw)
-        L(m, VH - m, m + c, VH - m, DIM, boldlw), L(m, VH - m, m, VH - m - c, DIM, boldlw)
-        L(VW - m, VH - m, VW - m - c, VH - m, DIM, boldlw), L(VW - m, VH - m, VW - m, VH - m - c, DIM, boldlw)
+            x1, y1 = xf(
+                CX - 32,
+                y,
+                sb,
+            )
 
-        # time / date (top right)
+            x2, y2 = xf(
+                CX + 32,
+                y,
+                sb,
+            )
+
+            line(
+                x1,
+                y1,
+                x2,
+                y2,
+                inner_color,
+                lw,
+            )
+
+        # -------------------------------------------------------------------
+        # Bank scale
+        # -------------------------------------------------------------------
+
+        for p1, p2 in BANK_TICKS:
+            line(
+                p1[0],
+                p1[1],
+                p2[0],
+                p2[1],
+                DIM,
+                lw,
+            )
+
+        triangle = [
+            rotp(
+                320,
+                62,
+                sb,
+            ),
+            rotp(
+                312,
+                77,
+                sb,
+            ),
+            rotp(
+                328,
+                77,
+                sb,
+            ),
+        ]
+
+        pygame.draw.polygon(
+            surface,
+            AMBER,
+            [
+                (
+                    x * k,
+                    y * k,
+                )
+                for x, y in triangle
+            ],
+        )
+
+        # -------------------------------------------------------------------
+        # Center crosshair
+        # -------------------------------------------------------------------
+
+        pygame.draw.circle(
+            surface,
+            AMBER,
+            (
+                int(CX * k),
+                int(CY * k),
+            ),
+            int(28 * k),
+            lw2,
+        )
+
+        line(
+            CX,
+            CY - 28,
+            CX,
+            CY - 14,
+            AMBER,
+            lw2,
+        )
+
+        line(
+            CX,
+            CY + 14,
+            CX,
+            CY + 28,
+            AMBER,
+            lw2,
+        )
+
+        pygame.draw.circle(
+            surface,
+            AMBER,
+            (
+                int(CX * k),
+                int(CY * k),
+            ),
+            int(2.4 * k),
+        )
+
+        # -------------------------------------------------------------------
+        # Heading arrow
+        # -------------------------------------------------------------------
+
+        angle = math.radians(sy)
+
+        arrow = [
+            (
+                CX + 46 * math.sin(angle),
+                CY - 46 * math.cos(angle),
+            ),
+            (
+                CX + 36 * math.sin(angle - 0.18),
+                CY - 36 * math.cos(angle - 0.18),
+            ),
+            (
+                CX + 36 * math.sin(angle + 0.18),
+                CY - 36 * math.cos(angle + 0.18),
+            ),
+        ]
+
+        pygame.draw.polygon(
+            surface,
+            AMBER,
+            [
+                (
+                    x * k,
+                    y * k,
+                )
+                for x, y in arrow
+            ],
+        )
+
+        # -------------------------------------------------------------------
+        # Corner brackets
+        # -------------------------------------------------------------------
+
+        margin = 12
+        corner = 30
+
+        line(
+            margin,
+            margin,
+            margin + corner,
+            margin,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            margin,
+            margin,
+            margin,
+            margin + corner,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            VW - margin,
+            margin,
+            VW - margin - corner,
+            margin,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            VW - margin,
+            margin,
+            VW - margin,
+            margin + corner,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            margin,
+            VH - margin,
+            margin + corner,
+            VH - margin,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            margin,
+            VH - margin,
+            margin,
+            VH - margin - corner,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            VW - margin,
+            VH - margin,
+            VW - margin - corner,
+            VH - margin,
+            DIM,
+            boldlw,
+        )
+
+        line(
+            VW - margin,
+            VH - margin,
+            VW - margin,
+            VH - margin - corner,
+            DIM,
+            boldlw,
+        )
+
+        # -------------------------------------------------------------------
+        # Time / date
+        # -------------------------------------------------------------------
+
         now_dt = datetime.now()
-        self.text(s, now_dt.strftime("%H:%M:%S"), CYAN, VW - 20, 14, 30, True, "ra")
-        self.text(s, now_dt.strftime("%a %d %b %Y").lower(), DIM, VW - 20, 48, 12, False, "ra")
 
-        # speed (bottom left)
-        spd = "--"
-        if gps:
-            spd = str(int(round(gps["speed"] * (2.23694 if self.unit == "mph" else 3.6))))
-        self.text(s, spd, AMBER, 20, VH - 58, 44, True, "la")
-        self.text(s, self.unit, AMBER, 20 + len(spd) * 26 + 14, VH - 40, 14, False, "la")
-        self.text(s, "ground speed", DIM, 20, VH - 16, 12, False, "la")
+        self.text(
+            surface,
+            now_dt.strftime("%H:%M:%S"),
+            CYAN,
+            VW - 20,
+            14,
+            30,
+            True,
+            "ra",
+        )
 
-        # gps (bottom right)
+        self.text(
+            surface,
+            now_dt.strftime(
+                "%a %d %b %Y"
+            ).lower(),
+            DIM,
+            VW - 20,
+            48,
+            12,
+            False,
+            "ra",
+        )
+
+        # -------------------------------------------------------------------
+        # Speed
+        # -------------------------------------------------------------------
+
+        speed = "--"
+
         if gps:
-            self.text(s, "gps", DIM, VW - 20, VH - 66, 12, False, "ra")
-            self.text(s, "%.5f %s" % (abs(gps["lat"]), "N" if gps["lat"] >= 0 else "S"),
-                      CYAN, VW - 20, VH - 52, 13, False, "ra")
-            self.text(s, "%.5f %s" % (abs(gps["lon"]), "E" if gps["lon"] >= 0 else "W"),
-                      CYAN, VW - 20, VH - 34, 13, False, "ra")
-            self.text(s, "%d sats - hdop %s" % (gps.get("sats", 0), gps.get("hdop", "-")),
-                      DIM, VW - 20, VH - 16, 12, False, "ra")
+            multiplier = (
+                2.23694
+                if self.unit == "mph"
+                else 3.6
+            )
+
+            speed = str(
+                int(
+                    round(
+                        float(gps["speed"])
+                        * multiplier
+                    )
+                )
+            )
+
+        self.text(
+            surface,
+            speed,
+            AMBER,
+            20,
+            VH - 58,
+            44,
+            True,
+            "la",
+        )
+
+        self.text(
+            surface,
+            self.unit,
+            AMBER,
+            20 + len(speed) * 26 + 14,
+            VH - 40,
+            14,
+            False,
+            "la",
+        )
+
+        self.text(
+            surface,
+            "ground speed",
+            DIM,
+            20,
+            VH - 16,
+            12,
+            False,
+            "la",
+        )
+
+        # -------------------------------------------------------------------
+        # GPS
+        # -------------------------------------------------------------------
+
+        if gps:
+            self.text(
+                surface,
+                "gps",
+                DIM,
+                VW - 20,
+                VH - 66,
+                12,
+                False,
+                "ra",
+            )
+
+            self.text(
+                surface,
+                "%.5f %s"
+                % (
+                    abs(float(gps["lat"])),
+                    "N"
+                    if float(gps["lat"]) >= 0
+                    else "S",
+                ),
+                CYAN,
+                VW - 20,
+                VH - 52,
+                13,
+                False,
+                "ra",
+            )
+
+            self.text(
+                surface,
+                "%.5f %s"
+                % (
+                    abs(float(gps["lon"])),
+                    "E"
+                    if float(gps["lon"]) >= 0
+                    else "W",
+                ),
+                CYAN,
+                VW - 20,
+                VH - 34,
+                13,
+                False,
+                "ra",
+            )
+
+            self.text(
+                surface,
+                "%d sats - hdop %s"
+                % (
+                    int(gps.get("sats", 0)),
+                    gps.get("hdop", "-"),
+                ),
+                DIM,
+                VW - 20,
+                VH - 16,
+                12,
+                False,
+                "ra",
+            )
+
         else:
-            self.text(s, "gps", DIM, VW - 20, VH - 40, 12, False, "ra")
-            self.text(s, "awaiting phone link", DIM, VW - 20, VH - 24, 12, False, "ra")
+            self.text(
+                surface,
+                "gps",
+                DIM,
+                VW - 20,
+                VH - 40,
+                12,
+                False,
+                "ra",
+            )
 
-        # bottom center readouts
-        mid = ("P %+d B %+d Y %03d G %.2f" %
-               (round(sp), round(sb), int(round(sy)) % 360, imu.get("g", 1.0)))
-        self.text(s, mid, DIM, CX, VH - 18, 12, False, "ca")
+            self.text(
+                surface,
+                "awaiting phone link",
+                DIM,
+                VW - 20,
+                VH - 24,
+                12,
+                False,
+                "ra",
+            )
 
-        # menu button (top left)
-        pygame.draw.rect(s, DIM, (20 * k, 16 * k, 40 * k, 40 * k), boldlw, 2)
+        # -------------------------------------------------------------------
+        # Orientation readout
+        # -------------------------------------------------------------------
+
+        readout = (
+            "P %+d B %+d Y %03d G %.2f"
+            % (
+                round(sp),
+                round(sb),
+                int(round(sy)) % 360,
+                imu.get("g", 1.0),
+            )
+        )
+
+        self.text(
+            surface,
+            readout,
+            DIM,
+            CX,
+            VH - 18,
+            12,
+            False,
+            "ca",
+        )
+
+        # -------------------------------------------------------------------
+        # Menu button
+        # -------------------------------------------------------------------
+
+        pygame.draw.rect(
+            surface,
+            DIM,
+            (
+                20 * k,
+                16 * k,
+                40 * k,
+                40 * k,
+            ),
+            boldlw,
+            2,
+        )
+
         for yy in (26, 36, 46):
-            L(28, yy, 52, yy, CYAN, lw2)
+            line(
+                28,
+                yy,
+                52,
+                yy,
+                CYAN,
+                lw2,
+            )
 
         if self.menu:
-            self.draw_menu(s, imu, gps, gps_age)
+            self.draw_menu(
+                surface,
+                imu,
+                gps,
+                gps_age,
+            )
 
         if not imu.get("ok"):
-            self.text(s, "awaiting glasses link", DIM, CX, 170, 15, False, "ca")
+            self.text(
+                surface,
+                "awaiting glasses link",
+                DIM,
+                CX,
+                170,
+                15,
+                False,
+                "ca",
+            )
 
-        pygame.transform.smoothscale(self.ss, (self.w, self.h), self.screen)
+        # -------------------------------------------------------------------
+        # Present
+        # -------------------------------------------------------------------
+
+        pygame.transform.smoothscale(
+            self.ss,
+            (
+                self.w,
+                self.h,
+            ),
+            self.screen,
+        )
+
         pygame.display.flip()
 
-    def draw_menu(self, s, imu, gps, gps_age):
+    # -----------------------------------------------------------------------
+    # Menu
+    # -----------------------------------------------------------------------
+
+    def draw_menu(
+        self,
+        surface,
+        imu,
+        gps,
+        gps_age,
+    ):
         k = self.k
-        x, y, w, h = 16, 64, 300, 170
-        panel = pygame.Surface((int(w * k), int(h * k)), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 230))
-        s.blit(panel, (x * k, y * k))
-        pygame.draw.rect(s, DIM, (x * k, y * k, w * k, h * k), max(2, int(1.2 * k)), 3)
-        self.text(s, "data links", DIM, x + 14, y + 10, 12)
-        self.text(s, "glasses imu", CYAN, x + 14, y + 34, 13)
-        self.text(s, "online" if imu.get("ok") else "offline",
-                  AMBER if imu.get("ok") else RED, x + w - 14, y + 34, 13, False, "ra")
-        self.text(s, "phone gps", CYAN, x + 14, y + 56, 13)
-        self.text(s, "online" if gps else "offline",
-                  AMBER if gps else RED, x + w - 14, y + 56, 13, False, "ra")
-        self.text(s, "imu rate", CYAN, x + 14, y + 78, 13)
-        self.text(s, "%d hz" % imu.get("hz", 0), AMBER, x + w - 14, y + 78, 13, False, "ra")
-        self.text(s, "gps age", CYAN, x + 14, y + 100, 13)
-        self.text(s, "-" if gps_age is None else "%.1f s" % gps_age, AMBER, x + w - 14, y + 100, 13, False, "ra")
-        self.text(s, "a/c recenter  y/u units", DIM, x + 14, y + 128, 12)
-        self.text(s, "x/m menu  b/esc quit", DIM, x + 14, y + 146, 12)
+
+        x = 16
+        y = 64
+        w = 300
+        h = 170
+
+        panel = pygame.Surface(
+            (
+                int(w * k),
+                int(h * k),
+            ),
+            pygame.SRCALPHA,
+        )
+
+        panel.fill(
+            (0, 0, 0, 230)
+        )
+
+        surface.blit(
+            panel,
+            (
+                x * k,
+                y * k,
+            ),
+        )
+
+        pygame.draw.rect(
+            surface,
+            DIM,
+            (
+                x * k,
+                y * k,
+                w * k,
+                h * k,
+            ),
+            max(2, int(1.2 * k)),
+            3,
+        )
+
+        self.text(
+            surface,
+            "data links",
+            DIM,
+            x + 14,
+            y + 10,
+            12,
+        )
+
+        self.text(
+            surface,
+            "glasses imu",
+            CYAN,
+            x + 14,
+            y + 34,
+            13,
+        )
+
+        self.text(
+            surface,
+            "online"
+            if imu.get("ok")
+            else "offline",
+            AMBER
+            if imu.get("ok")
+            else RED,
+            x + w - 14,
+            y + 34,
+            13,
+            False,
+            "ra",
+        )
+
+        self.text(
+            surface,
+            "phone gps",
+            CYAN,
+            x + 14,
+            y + 56,
+            13,
+        )
+
+        self.text(
+            surface,
+            "online"
+            if gps
+            else "offline",
+            AMBER
+            if gps
+            else RED,
+            x + w - 14,
+            y + 56,
+            13,
+            False,
+            "ra",
+        )
+
+        self.text(
+            surface,
+            "imu rate",
+            CYAN,
+            x + 14,
+            y + 78,
+            13,
+        )
+
+        self.text(
+            surface,
+            "%d hz"
+            % imu.get("hz", 0),
+            AMBER,
+            x + w - 14,
+            y + 78,
+            13,
+            False,
+            "ra",
+        )
+
+        self.text(
+            surface,
+            "gps age",
+            CYAN,
+            x + 14,
+            y + 100,
+            13,
+        )
+
+        self.text(
+            surface,
+            "-"
+            if gps_age is None
+            else "%.1f s" % gps_age,
+            AMBER,
+            x + w - 14,
+            y + 100,
+            13,
+            False,
+            "ra",
+        )
+
+        self.text(
+            surface,
+            "a/c recenter  y/u units",
+            DIM,
+            x + 14,
+            y + 128,
+            12,
+        )
+
+        self.text(
+            surface,
+            "x/m menu  b/esc quit",
+            DIM,
+            x + 14,
+            y + 146,
+            12,
+        )
+
+    # -----------------------------------------------------------------------
+    # Main loop
+    # -----------------------------------------------------------------------
 
     def run(self):
         running = True
-        imu = self.imu if self.imu is not None else type("D", (), {"recenter": lambda self: None})()
+
+        if self.imu is not None:
+            imu = self.imu
+        else:
+            class DemoImu:
+                @staticmethod
+                def recenter():
+                    pass
+
+            imu = DemoImu()
+
         while running:
-            for ev in pygame.event.get():
-                running = self.handle(ev, imu)
+            for event in pygame.event.get():
+                running = self.handle(
+                    event,
+                    imu,
+                )
+
             self.draw()
+
             self.clock.tick(60)
+
         pygame.quit()
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--demo", action="store_true", help="synthetic data, no glasses")
-    ap.add_argument("--debug", action="store_true", help="print pitch/bank/yaw at 60hz")
-    ap.add_argument("--gps-port", type=int, default=8676)
-    args = ap.parse_args()
-    Hud(demo=args.demo, gps_port=args.gps_port, debug=args.debug).run()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="synthetic data, no glasses",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="print pitch/bank/yaw at 60 Hz",
+    )
+
+    parser.add_argument(
+        "--gps-port",
+        type=int,
+        default=8676,
+    )
+
+    args = parser.parse_args()
+
+    Hud(
+        demo=args.demo,
+        gps_port=args.gps_port,
+        debug=args.debug,
+    ).run()
 
 
 if __name__ == "__main__":
