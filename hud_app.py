@@ -701,9 +701,8 @@ class Hud:
             ):
                 continue
 
-            # Distance from the HUD center.
-            # Rungs closest to the center are fully opaque;
-            # rungs farther away progressively fade out.
+            # Distance from the HUD centre.
+            # Nearby rungs are bright; distant rungs fade toward transparent.
             distance = abs(y - CY)
 
             fade = max(
@@ -714,7 +713,10 @@ class Hud:
                 ),
             )
 
-            # Keep a small amount of visibility at the extreme edges.
+            # Opacity:
+            #   centre = 255
+            #   75 px  = ~128
+            #   150 px = ~25
             alpha = int(
                 255 * (1.0 - fade)
             )
@@ -725,6 +727,7 @@ class Hud:
             )
 
             if degrees == 0:
+                # Zero-degree rung stays cyan.
                 color = (
                     CYAN[0],
                     CYAN[1],
@@ -736,16 +739,29 @@ class Hud:
                 half = 110
 
             else:
+                # Preserve the original cyan -> DIM colour gradient.
+                strength = 1.0 - fade * 0.70
+
                 color = (
-                    DIM[0],
-                    DIM[1],
-                    DIM[2],
+                    int(
+                        DIM[0]
+                        + (CYAN[0] - DIM[0]) * strength
+                    ),
+                    int(
+                        DIM[1]
+                        + (CYAN[1] - DIM[1]) * strength
+                    ),
+                    int(
+                        DIM[2]
+                        + (CYAN[2] - DIM[2]) * strength
+                    ),
                     alpha,
                 )
 
                 line_width = lw
                 half = 92
 
+            # Main rung.
             x1, y1 = xf(
                 CX - half,
                 y,
@@ -767,10 +783,10 @@ class Hud:
                 line_width,
             )
 
-            # Inner/reference segment fades slightly more than the main rung.
+            # Inner segment.
             inner_alpha = max(
                 15,
-                int(alpha * 0.70),
+                int(alpha * 0.75),
             )
 
             inner_color = (
@@ -800,6 +816,7 @@ class Hud:
                 inner_color,
                 lw,
             )
+
 
 
         # -------------------------------------------------------------------
