@@ -306,7 +306,7 @@ class Hud:
         boldlw = max(2, int(1.2 * k))
 
         # --- time-based smoothing (frame-rate independent) ---
-        pitch, bank, yaw = imu["pitch"], imu["bank"], imu.get("yaw", 0.0)
+        pitch, bank, yaw = imu["bank"], imu["pitch"], imu.get("yaw", 0.0)
         if self.debug:
             print(f"pitch={pitch:.2f} bank={bank:.2f} yaw={yaw:.2f}", flush=True)
         now = time.monotonic()
