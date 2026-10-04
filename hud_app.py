@@ -600,9 +600,7 @@ class Hud:
 
         # -------------------------------------------------------------------
         # Smooth orientation.
-        #
-        # Pitch and bank deliberately use the values published by imu.py
-        # without changing their meaning or swapping them here.
+        # Pitch and bank deliberately swapped compated to the values published by imu.py.
         # -------------------------------------------------------------------
 
         pitch = float(
@@ -686,9 +684,9 @@ class Hud:
                 width,
             )
 
-        # -------------------------------------------------------------------
+        # ---------------------------------------------------------------------------
         # Attitude ladder
-        # -------------------------------------------------------------------
+        # ---------------------------------------------------------------------------
 
         for degrees in LADDER_DEGS:
             y = (
@@ -703,40 +701,46 @@ class Hud:
             ):
                 continue
 
+            # Distance from the HUD center.
+            # Rungs closest to the center are fully opaque;
+            # rungs farther away progressively fade out.
             distance = abs(y - CY)
 
             fade = max(
                 0.0,
                 min(
                     1.0,
-                    distance / (VH * 0.5),
+                    distance / 150.0,
                 ),
             )
 
-            strength = (
-                1.0
-                - fade * 0.70
+            # Keep a small amount of visibility at the extreme edges.
+            alpha = int(
+                255 * (1.0 - fade)
+            )
+
+            alpha = max(
+                25,
+                min(255, alpha),
             )
 
             if degrees == 0:
-                color = tuple(
-                    int(c * strength)
-                    for c in CYAN
+                color = (
+                    CYAN[0],
+                    CYAN[1],
+                    CYAN[2],
+                    alpha,
                 )
 
                 line_width = lw2
                 half = 110
 
             else:
-                color = tuple(
-                    int(
-                        DIM[i]
-                        + (
-                            CYAN[i]
-                            - DIM[i]
-                        ) * strength
-                    )
-                    for i in range(3)
+                color = (
+                    DIM[0],
+                    DIM[1],
+                    DIM[2],
+                    alpha,
                 )
 
                 line_width = lw
@@ -763,9 +767,17 @@ class Hud:
                 line_width,
             )
 
-            inner_color = tuple(
-                int(c * strength * 0.75)
-                for c in DIM
+            # Inner/reference segment fades slightly more than the main rung.
+            inner_alpha = max(
+                15,
+                int(alpha * 0.70),
+            )
+
+            inner_color = (
+                DIM[0],
+                DIM[1],
+                DIM[2],
+                inner_alpha,
             )
 
             x1, y1 = xf(
@@ -788,6 +800,7 @@ class Hud:
                 inner_color,
                 lw,
             )
+
 
         # -------------------------------------------------------------------
         # Bank scale
