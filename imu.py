@@ -240,19 +240,18 @@ def euler_deg(q):
         )
     )
 
+    # Full-range pitch: -180..+180 instead of asin()'s -90..+90.
     pitch = math.degrees(
-        math.asin(
-            max(
-                -1.0,
-                min(1.0, 2 * (w * y - z * x)),
-            )
+        math.atan2(
+            2 * (w * y - z * x),
+            1 - 2 * (y * y + x * x),
         )
     )
 
     yaw = math.degrees(
         math.atan2(
             2 * (w * z + x * y),
-            1 - 2 * (y * y + z * z),
+            1 - 2 * (y * y + x * x),
         )
     )
 
