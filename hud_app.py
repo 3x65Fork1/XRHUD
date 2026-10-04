@@ -42,10 +42,7 @@ BG = (0, 0, 0)
 
 GPS_STALE_S = 6.0
 
-# 19 rungs total:
-# -90, -80, ... -10, 0, +10, ... +80, +90
-LADDER_DEGS = range(-90, 91, 10)
-
+LADDER_DEGS = range(-180, 181, 10)
 PITCH_PX_PER_DEG = 3.0
 LADDER_MARGIN = 120.0
 
@@ -57,7 +54,6 @@ FONT_PATHS = (
 
 FONT_PATHS_BOLD = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 )
 
@@ -693,39 +689,33 @@ class Hud:
         # -------------------------------------------------------------------
         # Attitude ladder
         #
-        # 19 rungs:
+        # 19 rungs total:
+        #   -90, -80, ... -10, 0, +10, ... +80, +90
         #
-        #       RED
-        #       ...
-        #     AMBER
-        #       ...
-        #     CYAN  <- centre
-        #       ...
-        #     AMBER
-        #       ...
-        #       RED
-        #
-        # Colour:
+        # Colour progresses from:
         #   centre = CYAN
         #   middle = AMBER
-        #   outside = RED
+        #   outer  = RED
         #
-        # Opacity:
+        # Opacity is based ONLY on distance from the central rung:
         #   centre = 100%
-        #   outside = 25%
-        #
-        # IMPORTANT:
-        # Alpha is NOT used for the ladder.
-        #
-        # Instead each rung colour is pre-blended against black:
-        #
-        #     final = colour * opacity
-        #
-        # This makes the transparency/fade an actual RGB value before
-        # smoothscale(), so it cannot be flattened or lost later.
+        #   outer  = 25%
         # -------------------------------------------------------------------
 
-        for degrees in LADDER_DEGS:
+        ladder_surface = pygame.Surface(
+            (
+                int(VW * k),
+                int(VH * k),
+            ),
+            pygame.SRCALPHA,
+        )
+
+        ladder_surface.fill(
+            (0, 0, 0, 0)
+        )
+
+        # Exactly 19 rungs, centred on zero.
+        for degrees in range(-90, 91, 10):
 
             y = (
                 CY
@@ -739,32 +729,23 @@ class Hud:
             ):
                 continue
 
-            # ---------------------------------------------------------------
-            # Distance from central rung.
+            # Distance from the CENTRAL RUNG.
             #
-            # 0.0 = centre
+            # 0.0 = central rung
             # 1.0 = outermost rung
-            # ---------------------------------------------------------------
 
-            rung_distance = (
-                abs(degrees) / 90.0
-            )
+            rung_distance = abs(degrees) / 90.0
 
-            # ---------------------------------------------------------------
             # Colour gradient:
             #
-            # 0.0 -> 0.5:
-            #     CYAN -> AMBER
-            #
-            # 0.5 -> 1.0:
-            #     AMBER -> RED
-            # ---------------------------------------------------------------
+            # centre -> cyan
+            # middle -> amber
+            # outer  -> red
 
             if rung_distance <= 0.5:
 
-                t_colour = (
-                    rung_distance / 0.5
-                )
+                # Cyan -> Amber
+                t = rung_distance / 0.5
 
                 rgb = tuple(
                     int(
@@ -772,14 +753,15 @@ class Hud:
                         + (
                             AMBER[i]
                             - CYAN[i]
-                        ) * t_colour
+                        ) * t
                     )
                     for i in range(3)
                 )
 
             else:
 
-                t_colour = (
+                # Amber -> Red
+                t = (
                     rung_distance - 0.5
                 ) / 0.5
 
@@ -789,57 +771,42 @@ class Hud:
                         + (
                             RED[i]
                             - AMBER[i]
-                        ) * t_colour
+                        ) * t
                     )
                     for i in range(3)
                 )
 
-            # ---------------------------------------------------------------
-            # Opacity:
+            # Opacity gradient:
             #
-            # centre = 255 / 100%
-            # outer  = 64 / 25%
+            # central rung = 100%
+            # outermost    = 25%
             #
-            # Maximum transparency = 75%.
-            # ---------------------------------------------------------------
+            # Therefore maximum transparency is 75%.
 
-            opacity = (
-                1.0
-                - 0.75 * rung_distance
-            )
-
-            # ---------------------------------------------------------------
-            # Convert the opacity into an actual RGB brightness.
-            #
-            # No alpha channel is used here.
-            #
-            # Since the final HUD background is black:
-            #
-            #   black + colour at 25% opacity
-            #
-            # is visually equivalent to:
-            #
-            #   colour * 0.25
-            #
-            # This is deliberately done before smoothscale().
-            # ---------------------------------------------------------------
-
-            faded_rgb = tuple(
-                max(
-                    0,
-                    min(
-                        255,
-                        int(
-                            channel * opacity
-                        ),
-                    ),
+            opacity = int(
+                255
+                * (
+                    1.0
+                    - 0.75 * rung_distance
                 )
-                for channel in rgb
             )
 
-            # ---------------------------------------------------------------
+            opacity = max(
+                64,
+                min(
+                    255,
+                    opacity,
+                ),
+            )
+
+            color = (
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                opacity,
+            )
+
             # Rung dimensions.
-            # ---------------------------------------------------------------
 
             if degrees == 0:
                 half = 110
@@ -848,9 +815,7 @@ class Hud:
                 half = 92
                 line_width = lw
 
-            # ---------------------------------------------------------------
-            # Apply bank/roll to the rung.
-            # ---------------------------------------------------------------
+            # Rotate the rung with bank/roll.
 
             x1, y1 = xf(
                 CX - half,
@@ -864,15 +829,9 @@ class Hud:
                 sb,
             )
 
-            # ---------------------------------------------------------------
-            # Draw as an OPAQUE RGB colour.
-            #
-            # There is intentionally no alpha channel here.
-            # ---------------------------------------------------------------
-
             pygame.draw.line(
-                surface,
-                faded_rgb,
+                ladder_surface,
+                color,
                 (
                     int(x1 * k),
                     int(y1 * k),
@@ -884,28 +843,21 @@ class Hud:
                 line_width,
             )
 
-            # ---------------------------------------------------------------
             # Inner segment.
             #
-            # Also pre-blended against black instead of using alpha.
-            # ---------------------------------------------------------------
+            # Same colour as the rung, but slightly dimmer.
 
-            inner_opacity = (
-                opacity * 0.65
+
+            inner_opacity = max(
+                32,
+                int(opacity * 0.65),
             )
 
-            inner_rgb = tuple(
-                max(
-                    0,
-                    min(
-                        255,
-                        int(
-                            channel
-                            * inner_opacity
-                        ),
-                    ),
-                )
-                for channel in rgb
+            inner_color = (
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                inner_opacity,
             )
 
             ix1, iy1 = xf(
@@ -921,8 +873,8 @@ class Hud:
             )
 
             pygame.draw.line(
-                surface,
-                inner_rgb,
+                ladder_surface,
+                inner_color,
                 (
                     int(ix1 * k),
                     int(iy1 * k),
@@ -933,6 +885,18 @@ class Hud:
                 ),
                 lw,
             )
+
+
+        # Composite the ladder onto the main HUD.
+
+
+        surface.blit(
+            ladder_surface,
+            (
+                0,
+                0,
+            ),
+        )
 
         # -------------------------------------------------------------------
         # Bank scale
