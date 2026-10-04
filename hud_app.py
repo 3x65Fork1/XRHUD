@@ -1115,6 +1115,18 @@ class Hud:
                 )
             )
 
+        # Label moved above the speed reading.
+        self.text(
+            surface,
+            "ground speed",
+            DIM,
+            20,
+            VH - 78,
+            12,
+            False,
+            "la",
+        )
+
         self.text(
             surface,
             speed,
@@ -1137,28 +1149,18 @@ class Hud:
             "la",
         )
 
-        self.text(
-            surface,
-            "ground speed",
-            DIM,
-            20,
-            VH - 16,
-            12,
-            False,
-            "la",
-        )
-
         # -------------------------------------------------------------------
         # GPS
         # -------------------------------------------------------------------
 
         if gps:
+            # GPS label moved above the coordinate/readout block.
             self.text(
                 surface,
                 "gps",
                 DIM,
                 VW - 20,
-                VH - 66,
+                VH - 82,
                 12,
                 False,
                 "ra",
@@ -1175,7 +1177,7 @@ class Hud:
                 ),
                 CYAN,
                 VW - 20,
-                VH - 52,
+                VH - 64,
                 13,
                 False,
                 "ra",
@@ -1192,7 +1194,7 @@ class Hud:
                 ),
                 CYAN,
                 VW - 20,
-                VH - 34,
+                VH - 46,
                 13,
                 False,
                 "ra",
@@ -1207,7 +1209,7 @@ class Hud:
                 ),
                 DIM,
                 VW - 20,
-                VH - 16,
+                VH - 28,
                 12,
                 False,
                 "ra",
@@ -1219,7 +1221,7 @@ class Hud:
                 "gps",
                 DIM,
                 VW - 20,
-                VH - 40,
+                VH - 60,
                 12,
                 False,
                 "ra",
@@ -1230,7 +1232,7 @@ class Hud:
                 "awaiting phone link",
                 DIM,
                 VW - 20,
-                VH - 24,
+                VH - 42,
                 12,
                 False,
                 "ra",
