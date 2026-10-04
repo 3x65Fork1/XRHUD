@@ -686,244 +686,241 @@ class Hud:
                 width,
             )
 
-                # -------------------------------------------------------------------
-                # Attitude ladder
-                #
-                # The ladder is rendered WITHOUT alpha.
-                #
-                # Instead, each rung's colour is pre-blended against the black HUD
-                # background. This makes the ladder fully opaque from Pygame's point
-                # of view and avoids alpha/smoothscale issues on the Xreal display.
-                #
-                # Visual behaviour:
-                #
-                #   centre = 100% brightness
-                #   outer  = 25% brightness
-                #
-                # Colour:
-                #
-                #   centre -> CYAN
-                #   middle -> AMBER
-                #   outer  -> RED
-                # -------------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # Attitude ladder
+        #
+        # The ladder is rendered WITHOUT alpha.
+        #
+        # Instead, each rung's colour is pre-blended against the black HUD
+        # background. This makes the ladder fully opaque from Pygame's point
+        # of view and avoids alpha/smoothscale issues on the Xreal display.
+        #
+        # Visual behaviour:
+        #
+        #   centre = 100% brightness
+        #   outer  = 25% brightness
+        #
+        # Colour:
+        #
+        #   centre -> CYAN
+        #   middle -> AMBER
+        #   outer  -> RED
+        # -------------------------------------------------------------------
 
-                ladder_surface = pygame.Surface(
-                    (
-                        int(VW * k),
-                        int(VH * k),
-                ))
+        ladder_surface = pygame.Surface(
+            (
+                int(VW * k),
+                int(VH * k),
+        ))
 
-                ladder_surface.fill(BG)
+        ladder_surface.fill(BG)
 
-                # Exactly 19 rungs:
-                #
-                #   -90 ... -10, 0, +10 ... +90
+        # Exactly 19 rungs:
+        #
+        #   -90 ... -10, 0, +10 ... +90
 
-                for degrees in range(-90, 91, 10):
+        for degrees in range(-90, 91, 10):
 
-                    y = (
-                        CY
-                        - degrees * PITCH_PX_PER_DEG
-                        + sp * PITCH_PX_PER_DEG
-                    )
+            y = (
+                CY
+                - degrees * PITCH_PX_PER_DEG
+                + sp * PITCH_PX_PER_DEG
+            )
 
-                    if (
-                        y < -LADDER_MARGIN
-                        or y > VH + LADDER_MARGIN
-                    ):
-                        continue
+            if (
+                y < -LADDER_MARGIN
+                or y > VH + LADDER_MARGIN
+            ):
+                continue
 
-                    # Distance from the visual centre.
-                    #
-                    # This keeps transparency/brightness centred on the actual HUD
-                    # centre as the ladder moves with pitch.
+            # ---------------------------------------------------------------
+            # Distance from the visual centre.
+            #
+            # This keeps transparency/brightness centred on the actual HUD
+            # centre as the ladder moves with pitch.
+            # ---------------------------------------------------------------
 
-                    visual_distance = abs(y - CY)
+            visual_distance = abs(y - CY)
 
-                    max_distance = (
-                        90.0 * PITCH_PX_PER_DEG
-                    )
+            max_distance = (
+                90.0 * PITCH_PX_PER_DEG
+            )
 
-                    rung_distance = min(
-                        1.0,
-                        visual_distance / max_distance,
-                    )
+            rung_distance = min(
+                1.0,
+                visual_distance / max_distance,
+            )
 
-                    # Colour gradient:
-                    #
-                    # centre -> cyan
-                    # middle -> amber
-                    # outer  -> red
+            # ---------------------------------------------------------------
+            # Colour gradient:
+            #
+            # centre -> cyan
+            # middle -> amber
+            # outer  -> red
+            # ---------------------------------------------------------------
 
-                    if rung_distance <= 0.5:
+            if rung_distance <= 0.5:
 
-                        # Cyan -> Amber
+                # Cyan -> Amber
 
-                        color_t = (
-                            rung_distance / 0.5
-                        )
-
-                        rgb = tuple(
-                            int(
-                                CYAN[i]
-                                + (
-                                    AMBER[i]
-                                    - CYAN[i]
-                                ) * color_t
-                            )
-                            for i in range(3)
-                        )
-
-                    else:
-
-                        # Amber -> Red
-
-                        color_t = (
-                            rung_distance - 0.5
-                        ) / 0.5
-
-                        rgb = tuple(
-                            int(
-                                AMBER[i]
-                                + (
-                                    RED[i]
-                                    - AMBER[i]
-                                ) * color_t
-                            )
-                            for i in range(3)
-                        )
-
-                    # Brightness / transparency.
-                    #
-                    # We no longer use an alpha channel.
-                    #
-                    # Instead:
-                    #
-                    #   255 = full colour
-                    #    64 = 25% colour
-                    #
-                    # Since BG is black, multiplying the colour by this factor gives
-                    # exactly the same visual result as alpha compositing against
-                    # black.
-
-                   brightness = (
-                        1.0
-                        - 0.75 * rung_distance
-                    )
-
-                    color = tuple(
-                        max(
-                            0,
-                            min(
-                                255,
-                                int(
-                                    channel * brightness
-                                ),
-                            ),
-                        )
-                        for channel in rgb
-                    )
-
-
-                    # Rung dimensions.
-
-                    if degrees == 0:
-                        half = 110
-                        line_width = lw2
-                    else:
-                        half = 92
-                        line_width = lw
-
-
-                    # Rotate rung with current bank.
-
-                    x1, y1 = xf(
-                        CX - half,
-                        y,
-                        sb,
-                    )
-
-                    x2, y2 = xf(
-                        CX + half,
-                        y,
-                        sb,
-                    )
-
-                    pygame.draw.line(
-                        ladder_surface,
-                        color,
-                        (
-                            int(x1 * k),
-                            int(y1 * k),
-                        ),
-                        (
-                            int(x2 * k),
-                            int(y2 * k),
-                        ),
-                        line_width,
-                    )
-
-
-                    # Inner segment.
-                    #
-                    # Previously this used alpha * 0.65. Since the ladder is now
-                    # opaque, simply scale the already-computed RGB colour.
-
-
-                    inner_color = tuple(
-                        int(channel * 0.65)
-                        for channel in color
-                    )
-
-                    ix1, iy1 = xf(
-                        CX - 32,
-                        y,
-                        sb,
-                    )
-
-                    ix2, iy2 = xf(
-                        CX + 32,
-                        y,
-                        sb,
-                    )
-
-                    pygame.draw.line(
-                        ladder_surface,
-                        inner_color,
-                        (
-                            int(ix1 * k),
-                            int(iy1 * k),
-                        ),
-                        (
-                            int(ix2 * k),
-                            int(iy2 * k),
-                        ),
-                        lw,
-                    )
-
-                # Composite ladder.
-                #
-                # There is NO alpha here. The ladder is already blended against
-                # black, so this is a normal opaque blit.
-
-
-                surface.blit(
-                    ladder_surface,
-                    (0, 0),
+                color_t = (
+                    rung_distance / 0.5
                 )
 
+                rgb = tuple(
+                    int(
+                        CYAN[i]
+                        + (
+                            AMBER[i]
+                            - CYAN[i]
+                        ) * color_t
+                    )
+                    for i in range(3)
+                )
 
+            else:
 
-        # Composite the ladder onto the main HUD.
+                # Amber -> Red
 
+                color_t = (
+                    rung_distance - 0.5
+                ) / 0.5
+
+                rgb = tuple(
+                    int(
+                        AMBER[i]
+                        + (
+                            RED[i]
+                            - AMBER[i]
+                        ) * color_t
+                    )
+                    for i in range(3)
+                )
+
+            # ---------------------------------------------------------------
+            # Brightness / transparency.
+            #
+            # We no longer use an alpha channel.
+            #
+            # Instead:
+            #
+            #   255 = full colour
+            #    64 = 25% colour
+            #
+            # Since BG is black, multiplying the colour by this factor gives
+            # exactly the same visual result as alpha compositing against
+            # black.
+            # ---------------------------------------------------------------
+
+            brightness = (
+                1.0
+                - 0.75 * rung_distance
+            )
+
+            color = tuple(
+                max(
+                    0,
+                    min(
+                        255,
+                        int(
+                            channel * brightness
+                        ),
+                    ),
+                )
+                for channel in rgb
+            )
+
+            # ---------------------------------------------------------------
+            # Rung dimensions.
+            # ---------------------------------------------------------------
+
+            if degrees == 0:
+                half = 110
+                line_width = lw2
+            else:
+                half = 92
+                line_width = lw
+
+            # ---------------------------------------------------------------
+            # Rotate rung with current bank.
+            # ---------------------------------------------------------------
+
+            x1, y1 = xf(
+                CX - half,
+                y,
+                sb,
+            )
+
+            x2, y2 = xf(
+                CX + half,
+                y,
+                sb,
+            )
+
+            pygame.draw.line(
+                ladder_surface,
+                color,
+                (
+                    int(x1 * k),
+                    int(y1 * k),
+                ),
+                (
+                    int(x2 * k),
+                    int(y2 * k),
+                ),
+                line_width,
+            )
+
+            # ---------------------------------------------------------------
+            # Inner segment.
+            #
+            # Previously this used alpha * 0.65. Since the ladder is now
+            # opaque, simply scale the already-computed RGB colour.
+            # ---------------------------------------------------------------
+
+            inner_color = tuple(
+                int(channel * 0.65)
+                for channel in color
+            )
+
+            ix1, iy1 = xf(
+                CX - 32,
+                y,
+                sb,
+            )
+
+            ix2, iy2 = xf(
+                CX + 32,
+                y,
+                sb,
+            )
+
+            pygame.draw.line(
+                ladder_surface,
+                inner_color,
+                (
+                    int(ix1 * k),
+                    int(iy1 * k),
+                ),
+                (
+                    int(ix2 * k),
+                    int(iy2 * k),
+                ),
+                lw,
+            )
+
+        # -------------------------------------------------------------------
+        # Composite ladder.
+        #
+        # There is NO alpha here. The ladder is already blended against
+        # black, so this is a normal opaque blit.
+        # -------------------------------------------------------------------
 
         surface.blit(
             ladder_surface,
-            (
-                0,
-                0,
-            ),
+            (0, 0),
         )
+
 
         # -------------------------------------------------------------------
         # Bank scale
