@@ -351,7 +351,10 @@ class Hud:
 
         pygame.mouse.set_visible(False)
 
-        self.k = 3.0
+        self.k = min(
+            self.w / VW,
+            self.h / VH,
+        )
 
         self.ss = pygame.Surface(
             (
@@ -360,6 +363,7 @@ class Hud:
             ),
             pygame.SRCALPHA,
         )
+
 
         self.fonts = {}
 
@@ -1689,13 +1693,12 @@ class Hud:
         # Present
         # -------------------------------------------------------------------
 
-        pygame.transform.smoothscale(
+        self.screen.blit(
             self.ss,
             (
-                self.w,
-                self.h,
+                (self.w - self.ss.get_width()) // 2,
+                (self.h - self.ss.get_height()) // 2,
             ),
-            self.screen,
         )
 
         pygame.display.flip()
