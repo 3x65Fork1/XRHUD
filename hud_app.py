@@ -45,48 +45,94 @@ GPS_STALE_S = 6.0
 PITCH_PX_PER_DEG = 3.0
 LADDER_MARGIN = 120.0
 
+
+# ---------------------------------------------------------------------------
+# Fonts
+#
+# Prefer real TrueType fonts.  pygame's default bitmap font is intentionally
+# avoided because it can appear as blocky text on the scaled HUD.
+# ---------------------------------------------------------------------------
+
 FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 )
 
 FONT_PATHS_BOLD = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
 )
+
 
 # ---------------------------------------------------------------------------
 # Unified attitude / heading instrument
 # ---------------------------------------------------------------------------
 
-# The entire attitude instrument is biased upward.
-# The center of the display remains comparatively open.
+# Large transparent spherical reference.
 ATTITUDE_CENTER_X = CX
-ATTITUDE_CENTER_Y = 122.0
+ATTITUDE_CENTER_Y = 145.0
 
-# Heading ring.
-ATTITUDE_RADIUS = 132.0
+# Large enough to become the dominant visual instrument.
+ATTITUDE_RADIUS = 205.0
 
-# Number of heading ticks around the full circle.
 HEADING_TICKS = 72
 
-# Only the upper portion of the spherical instrument is visible.
-ATTITUDE_CLIP_Y = 182.0
+# Allow the large sphere to occupy the upper/middle HUD while leaving
+# the bottom telemetry unobstructed.
+ATTITUDE_CLIP_Y = 238.0
 
-# Width of the pitch surface.
-ATTITUDE_HALF_WIDTH = 108.0
+# Width of the projected pitch surface.
+ATTITUDE_HALF_WIDTH = 165.0
 
-# Perspective amount applied to the pitch ladder.
-ATTITUDE_PERSPECTIVE = 0.32
+# Amount of perspective compression toward the edges.
+ATTITUDE_PERSPECTIVE = 0.42
 
+# Transparency is achieved by reducing RGB intensity rather than drawing
+# a filled translucent sphere.
+ATTITUDE_TICK_MIN_BRIGHTNESS = 0.14
+ATTITUDE_TICK_MAX_BRIGHTNESS = 0.52
+
+ATTITUDE_LADDER_MIN_BRIGHTNESS = 0.16
+ATTITUDE_LADDER_MAX_BRIGHTNESS = 0.60
+
+
+# ---------------------------------------------------------------------------
+# Font discovery
+# ---------------------------------------------------------------------------
 
 def _find_font(bold=False):
-    paths = FONT_PATHS_BOLD if bold else FONT_PATHS
+    paths = (
+        FONT_PATHS_BOLD
+        if bold
+        else FONT_PATHS
+    )
 
     for path in paths:
-        if os.path.exists(path):
+        if os.path.isfile(path):
             return path
+
+    # Last-resort system font lookup.
+    try:
+        name = (
+            "DejaVu Sans"
+            if not bold
+            else "DejaVu Sans"
+        )
+
+        path = pygame.font.match_font(
+            name,
+            bold=bold,
+        )
+
+        if path:
+            return path
+
+    except Exception:
+        pass
 
     return None
 
@@ -115,7 +161,10 @@ class GpsListener(threading.Thread):
             1,
         )
 
-        self.sock.bind(("0.0.0.0", port))
+        self.sock.bind(
+            ("0.0.0.0", port)
+        )
+
         self.sock.settimeout(1.0)
 
     def run(self):
@@ -124,7 +173,10 @@ class GpsListener(threading.Thread):
                 raw, _ = self.sock.recvfrom(2048)
 
                 self.data = json.loads(
-                    raw.decode("utf-8", "replace")
+                    raw.decode(
+                        "utf-8",
+                        "replace",
+                    )
                 )
 
                 self.t = time.monotonic()
@@ -171,7 +223,10 @@ class ImuManager:
                 reader = ImuReader()
                 reader.start()
 
-                deadline = time.monotonic() + 5.0
+                deadline = (
+                    time.monotonic()
+                    + 5.0
+                )
 
                 while (
                     reader.is_alive()
@@ -201,7 +256,8 @@ class ImuManager:
 
             except Exception as exc:
                 print(
-                    f"[hud] imu error: {type(exc).__name__}: {exc}",
+                    "[hud] imu error: "
+                    f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
 
@@ -272,7 +328,9 @@ class Hud:
 
         self.pads = []
 
-        for i in range(pygame.joystick.get_count()):
+        for i in range(
+            pygame.joystick.get_count()
+        ):
             joystick = pygame.joystick.Joystick(i)
             joystick.init()
             self.pads.append(joystick)
@@ -287,7 +345,10 @@ class Hud:
             pygame.FULLSCREEN | pygame.NOFRAME,
         )
 
-        pygame.display.set_caption("xreal hud")
+        pygame.display.set_caption(
+            "xreal hud"
+        )
+
         pygame.mouse.set_visible(False)
 
         self.k = 3.0
@@ -337,7 +398,11 @@ class Hud:
 
     def _load_unit(self):
         try:
-            with open(self._cfg(), "r") as f:
+            with open(
+                self._cfg(),
+                "r",
+                encoding="utf-8",
+            ) as f:
                 value = f.read().strip()
 
             return value or "mph"
@@ -354,7 +419,11 @@ class Hud:
                 exist_ok=True,
             )
 
-            with open(path, "w") as f:
+            with open(
+                path,
+                "w",
+                encoding="utf-8",
+            ) as f:
                 f.write(self.unit)
 
         except Exception:
@@ -365,35 +434,58 @@ class Hud:
     # -----------------------------------------------------------------------
 
     def font(self, logical_px, bold=False):
+        """
+        Return a real antialiased TrueType font.
+
+        Fonts are rendered at the high-resolution backing surface size,
+        then the complete HUD is scaled to the display.  This avoids the
+        blocky appearance produced by pygame's default bitmap font.
+        """
+
         px = max(
-            8,
-            int(logical_px * self.k * 0.72),
+            10,
+            int(
+                logical_px
+                * self.k
+                * 0.72
+            ),
         )
 
-        key = (px, bold)
+        key = (
+            px,
+            bool(bold),
+        )
 
-        if key not in self.fonts:
-            path = _find_font(bold)
+        if key in self.fonts:
+            return self.fonts[key]
 
-            try:
-                if path:
-                    self.fonts[key] = pygame.font.Font(
-                        path,
-                        px,
-                    )
-                else:
-                    self.fonts[key] = pygame.font.Font(
-                        None,
-                        px,
-                    )
+        path = _find_font(bold)
 
-            except Exception:
-                self.fonts[key] = pygame.font.Font(
-                    None,
+        try:
+            if path:
+                font = pygame.font.Font(
+                    path,
                     px,
                 )
+            else:
+                # SysFont still gives us a scalable TrueType font when
+                # available, unlike pygame.font.Font(None, ...).
+                font = pygame.font.SysFont(
+                    "DejaVu Sans",
+                    px,
+                    bold=bool(bold),
+                )
 
-        return self.fonts[key]
+        except Exception:
+            font = pygame.font.SysFont(
+                "sans",
+                px,
+                bold=bool(bold),
+            )
+
+        self.fonts[key] = font
+
+        return font
 
     def text(
         self,
@@ -406,33 +498,61 @@ class Hud:
         bold=False,
         anchor="la",
     ):
-        rendered = self.font(
+        """
+        Draw antialiased HUD text.
+
+        Supported horizontal anchors:
+            la = left
+            ca = center
+            ra = right
+
+        The vertical component remains top-aligned, matching the original
+        HUD layout.
+        """
+
+        font = self.font(
             size,
             bold,
-        ).render(
-            txt,
+        )
+
+        rendered = font.render(
+            str(txt),
             True,
             color,
         )
 
         rect = rendered.get_rect()
 
-        if anchor[0] == "r":
+        px = int(
+            round(x * self.k)
+        )
+
+        py = int(
+            round(y * self.k)
+        )
+
+        horizontal = (
+            anchor[0]
+            if anchor
+            else "l"
+        )
+
+        if horizontal == "r":
             rect.topright = (
-                int(x * self.k),
-                int(y * self.k),
+                px,
+                py,
             )
 
-        elif anchor[0] == "c":
+        elif horizontal == "c":
             rect.midtop = (
-                int(x * self.k),
-                int(y * self.k),
+                px,
+                py,
             )
 
         else:
             rect.topleft = (
-                int(x * self.k),
-                int(y * self.k),
+                px,
+                py,
             )
 
         surface.blit(
@@ -502,7 +622,8 @@ class Hud:
                 "pitch": math.sin(t / 2.1) * 9.0,
                 "bank": math.sin(t / 1.3) * 22.0,
                 "yaw": math.sin(t / 3.7) * 40.0,
-                "g": 1.0 + math.sin(t / 0.9) * 0.12,
+                "g": 1.0
+                + math.sin(t / 0.9) * 0.12,
             }
 
         return self.imu.state
@@ -513,15 +634,24 @@ class Hud:
 
     def demo_gps(self, t):
         return {
-            "lat": 37.7749 + math.sin(t / 60.0) * 0.001,
-            "lon": -122.4194 + math.cos(t / 60.0) * 0.001,
-            "speed": 24.6 + math.sin(t / 4.0) * 3.0,
+            "lat": (
+                37.7749
+                + math.sin(t / 60.0) * 0.001
+            ),
+            "lon": (
+                -122.4194
+                + math.cos(t / 60.0) * 0.001
+            ),
+            "speed": (
+                24.6
+                + math.sin(t / 4.0) * 3.0
+            ),
             "sats": 14,
             "hdop": 0.8,
         }
 
     # -----------------------------------------------------------------------
-    # Unified attitude / heading instrument
+    # Unified spherical attitude instrument
     # -----------------------------------------------------------------------
 
     def draw_attitude_instrument(
@@ -535,24 +665,22 @@ class Hud:
         lw2,
     ):
         """
-        Draw the heading scale and pitch ladder as one unified,
-        three-dimensional attitude reference.
+        Large, transparent, unified spherical attitude reference.
 
-        The heading scale forms the outer spherical rim.
+        Heading and pitch are projected onto the same implied sphere.
 
-        The pitch ladder is projected onto that same implied surface,
-        rather than behaving like an independent flat ladder.
+        No opaque background is drawn.
+        No labels are drawn inside the instrument.
         """
-
-        # -------------------------------------------------------------------
-        # Shared instrument transform
-        # -------------------------------------------------------------------
 
         center_x = ATTITUDE_CENTER_X
         center_y = ATTITUDE_CENTER_Y
         radius = ATTITUDE_RADIUS
 
-        # Bank rotates the entire attitude surface.
+        # -------------------------------------------------------------------
+        # Shared bank transform
+        # -------------------------------------------------------------------
+
         bank_r = math.radians(-bank)
 
         cos_b = math.cos(bank_r)
@@ -572,14 +700,16 @@ class Hud:
             )
 
         # -------------------------------------------------------------------
-        # Heading rim
+        # Heading ring
         # -------------------------------------------------------------------
 
-        # Yaw shifts the heading positions around the same sphere.
-        heading_step = 360.0 / HEADING_TICKS
+        heading_step = (
+            360.0 / HEADING_TICKS
+        )
 
-        for i in range(HEADING_TICKS):
-
+        for i in range(
+            HEADING_TICKS
+        ):
             heading = (
                 i * heading_step
                 + yaw
@@ -589,28 +719,26 @@ class Hud:
                 heading - 90.0
             )
 
-            # Circular base position.
-            local_x = (
+            outer_x = (
                 center_x
-                + radius * math.cos(angle)
+                + radius
+                * math.cos(angle)
             )
 
-            local_y = (
+            outer_y = (
                 center_y
-                + radius * math.sin(angle)
+                + radius
+                * math.sin(angle)
             )
 
-            # The circle is the outer boundary of the virtual sphere.
-            #
-            # Keep only the forward/upper portion.
-            if local_y >= ATTITUDE_CLIP_Y:
+            if outer_y >= ATTITUDE_CLIP_Y:
                 continue
 
             # ---------------------------------------------------------------
-            # Depth.
+            # Spherical depth.
             #
-            # The top-center is closest to the viewer.
-            # The sides fall away into depth.
+            # The top/front of the sphere is stronger.
+            # The sides recede into transparency.
             # ---------------------------------------------------------------
 
             front = max(
@@ -619,88 +747,96 @@ class Hud:
             )
 
             depth = (
+                0.12
+                + front * 0.88
+            )
+
+            side_fade = (
                 0.30
-                + front * 0.70
+                + 0.70 * front
             )
 
-            # Major ticks every 15 degrees.
-            major = (
-                i % 3 == 0
+            brightness = (
+                ATTITUDE_TICK_MIN_BRIGHTNESS
+                + (
+                    ATTITUDE_TICK_MAX_BRIGHTNESS
+                    - ATTITUDE_TICK_MIN_BRIGHTNESS
+                )
+                * depth
+                * side_fade
             )
 
-            # Cardinal ticks every 45 degrees.
+            # ---------------------------------------------------------------
+            # Tick hierarchy
+            # ---------------------------------------------------------------
+
             cardinal = (
                 i % 9 == 0
             )
 
+            major = (
+                i % 3 == 0
+            )
+
             if cardinal:
-                tick_height = 18.0
-                base_width = 2.4
+                tick_height = 22.0
+                tick_base_width = 2.2
 
             elif major:
-                tick_height = 13.0
-                base_width = 1.8
+                tick_height = 15.0
+                tick_base_width = 1.5
 
             else:
-                tick_height = 7.0
-                base_width = 1.1
+                tick_height = 8.0
+                tick_base_width = 0.9
 
             tick_height *= (
-                0.65
-                + depth * 0.65
+                0.45
+                + depth * 0.75
             )
 
             tick_width = max(
                 1,
                 int(
-                    base_width
+                    tick_base_width
                     * (
-                        0.65
-                        + depth * 0.55
+                        0.50
+                        + depth * 0.70
                     )
                     * k
                 ),
             )
 
-            # Radial direction.
             radial_x = math.cos(angle)
             radial_y = math.sin(angle)
 
-            outer_x = local_x
-            outer_y = local_y
-
             inner_x = (
-                local_x
-                - radial_x * tick_height
+                outer_x
+                - radial_x
+                * tick_height
             )
 
             inner_y = (
-                local_y
-                - radial_y * tick_height
+                outer_y
+                - radial_y
+                * tick_height
             )
 
-            # Rotate the whole spherical reference with bank.
-            x1, y1 = rotate_point(
+            p1 = rotate_point(
                 outer_x,
                 outer_y,
             )
 
-            x2, y2 = rotate_point(
+            p2 = rotate_point(
                 inner_x,
                 inner_y,
             )
 
-            # Clip below the visible horizon.
             if (
-                y1 >= ATTITUDE_CLIP_Y
-                and y2 >= ATTITUDE_CLIP_Y
+                p1[1] >= ATTITUDE_CLIP_Y
+                and p2[1] >= ATTITUDE_CLIP_Y
             ):
                 continue
-
-            brightness = (
-                0.40
-                + depth * 0.60
-            )
 
             color = tuple(
                 max(
@@ -720,26 +856,23 @@ class Hud:
                 surface,
                 color,
                 (
-                    int(x1 * k),
-                    int(y1 * k),
+                    int(p1[0] * k),
+                    int(p1[1] * k),
                 ),
                 (
-                    int(x2 * k),
-                    int(y2 * k),
+                    int(p2[0] * k),
+                    int(p2[1] * k),
                 ),
                 tick_width,
             )
 
         # -------------------------------------------------------------------
-        # Pitch ladder
+        # Pitch ladder projected onto the sphere
         # -------------------------------------------------------------------
 
-        # The pitch ladder is projected onto the same circular surface.
-        #
-        # Positive pitch moves the attitude surface downward, matching
-        # the existing attitude convention.
         pitch_offset = (
-            pitch * PITCH_PX_PER_DEG
+            pitch
+            * PITCH_PX_PER_DEG
         )
 
         for degrees in range(
@@ -747,37 +880,36 @@ class Hud:
             91,
             10,
         ):
-
-            # Vertical position on the shared spherical surface.
             local_y = (
                 center_y
-                - degrees * PITCH_PX_PER_DEG
+                - degrees
+                * PITCH_PX_PER_DEG
                 + pitch_offset
             )
 
-            # Distance from the center of the sphere.
             vertical = (
                 local_y
                 - center_y
             )
 
             normalized = (
-                vertical / radius
+                vertical
+                / radius
             )
 
-            # Outside the spherical surface.
             if abs(normalized) > 1.0:
                 continue
 
-            # Spherical cross-section.
+            # Width of the circular cross-section.
             sphere_width = math.sqrt(
                 max(
                     0.0,
-                    1.0 - normalized * normalized,
+                    1.0
+                    - normalized
+                    * normalized,
                 )
             )
 
-            # Perspective deliberately compresses the outer portions.
             perspective = (
                 1.0
                 - ATTITUDE_PERSPECTIVE
@@ -790,33 +922,72 @@ class Hud:
                 * perspective
             )
 
-            # Keep the center section stronger.
             if degrees == 0:
-                half_width *= 1.08
+                half_width *= 1.05
 
-            # Pitch lines become slightly more dimensional toward the
-            # center/front of the virtual sphere.
-            depth = (
+            # ----------------------------------------------------------------
+            # Depth / transparency
+            # ----------------------------------------------------------------
+
+            center_depth = (
                 1.0
                 - abs(normalized)
             )
 
             brightness = (
-                0.48
-                + 0.52 * depth
+                ATTITUDE_LADDER_MIN_BRIGHTNESS
+                + (
+                    ATTITUDE_LADDER_MAX_BRIGHTNESS
+                    - ATTITUDE_LADDER_MIN_BRIGHTNESS
+                )
+                * center_depth
             )
 
-            if degrees == 0:
-                base_color = CYAN
-                line_width = lw2
+            # ----------------------------------------------------------------
+            # Existing cyan -> amber -> red language
+            # ----------------------------------------------------------------
 
-            elif abs(degrees) <= 30:
-                base_color = AMBER
-                line_width = lw
+            distance = abs(degrees)
+
+            if distance <= 20:
+                base_color = CYAN
+
+            elif distance <= 50:
+                blend = (
+                    distance - 20.0
+                ) / 30.0
+
+                base_color = tuple(
+                    int(
+                        CYAN[i]
+                        + (
+                            AMBER[i]
+                            - CYAN[i]
+                        )
+                        * blend
+                    )
+                    for i in range(3)
+                )
 
             else:
-                base_color = RED
-                line_width = lw
+                blend = min(
+                    1.0,
+                    (
+                        distance - 50.0
+                    ) / 40.0,
+                )
+
+                base_color = tuple(
+                    int(
+                        AMBER[i]
+                        + (
+                            RED[i]
+                            - AMBER[i]
+                        )
+                        * blend
+                    )
+                    for i in range(3)
+                )
 
             color = tuple(
                 max(
@@ -832,9 +1003,23 @@ class Hud:
                 for channel in base_color
             )
 
-            # ---------------------------------------------------------------
-            # Main projected pitch line.
-            # ---------------------------------------------------------------
+            if degrees == 0:
+                line_width = lw2
+
+            elif distance <= 30:
+                line_width = lw
+
+            else:
+                line_width = max(
+                    1,
+                    int(
+                        lw * 0.72
+                    ),
+                )
+
+            # ----------------------------------------------------------------
+            # Main pitch line
+            # ----------------------------------------------------------------
 
             x1 = (
                 center_x
@@ -846,20 +1031,16 @@ class Hud:
                 + half_width
             )
 
-            y = local_y
-
             p1 = rotate_point(
                 x1,
-                y,
+                local_y,
             )
 
             p2 = rotate_point(
                 x2,
-                y,
+                local_y,
             )
 
-            # Don't allow the attitude element to invade the lower
-            # sightline.
             if (
                 p1[1] > ATTITUDE_CLIP_Y
                 and p2[1] > ATTITUDE_CLIP_Y
@@ -880,31 +1061,29 @@ class Hud:
                 line_width,
             )
 
-            # ---------------------------------------------------------------
-            # Short inner line.
-            #
-            # This gives the ladder a layered / dimensional appearance
-            # without introducing a separate visual element.
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # Very faint inner detail
+            # ----------------------------------------------------------------
 
             inner_half = (
-                half_width
-                * 0.34
+                half_width * 0.28
             )
 
             inner_color = tuple(
-                int(channel * 0.55)
+                int(
+                    channel * 0.30
+                )
                 for channel in color
             )
 
             ip1 = rotate_point(
                 center_x - inner_half,
-                y,
+                local_y,
             )
 
             ip2 = rotate_point(
                 center_x + inner_half,
-                y,
+                local_y,
             )
 
             pygame.draw.line(
@@ -920,20 +1099,83 @@ class Hud:
                 ),
                 max(
                     1,
-                    lw,
+                    int(
+                        lw * 0.60
+                    ),
                 ),
             )
 
         # -------------------------------------------------------------------
-        # Central attitude reference.
+        # Segmented spherical rim
         #
-        # This is deliberately very small and sits above the actual
-        # sightline so the center remains open.
+        # No filled circle. Just a very faint boundary.
         # -------------------------------------------------------------------
 
-        marker_y = center_y + 38.0
+        rim_points = []
 
-        marker_half = 15.0
+        for i in range(73):
+            angle = math.radians(
+                -180.0
+                + i * 5.0
+            )
+
+            x = (
+                center_x
+                + radius
+                * math.cos(angle)
+            )
+
+            y = (
+                center_y
+                + radius
+                * math.sin(angle)
+            )
+
+            if y < ATTITUDE_CLIP_Y:
+                rim_points.append(
+                    rotate_point(x, y)
+                )
+
+        for i in range(
+            len(rim_points) - 1
+        ):
+            # Gaps make the sphere feel transparent rather than outlined.
+            if i % 2:
+                continue
+
+            p1 = rim_points[i]
+            p2 = rim_points[i + 1]
+
+            pygame.draw.line(
+                surface,
+                (
+                    int(DIM[0] * 0.18),
+                    int(DIM[1] * 0.18),
+                    int(DIM[2] * 0.18),
+                ),
+                (
+                    int(p1[0] * k),
+                    int(p1[1] * k),
+                ),
+                (
+                    int(p2[0] * k),
+                    int(p2[1] * k),
+                ),
+                max(
+                    1,
+                    int(0.75 * k),
+                ),
+            )
+
+        # -------------------------------------------------------------------
+        # Tiny central reference
+        # -------------------------------------------------------------------
+
+        marker_y = (
+            center_y + 32.0
+        )
+
+        marker_half = 13.0
 
         p1 = rotate_point(
             center_x - marker_half,
@@ -941,12 +1183,12 @@ class Hud:
         )
 
         p2 = rotate_point(
-            center_x - 4.0,
+            center_x - 3.0,
             marker_y,
         )
 
         p3 = rotate_point(
-            center_x + 4.0,
+            center_x + 3.0,
             marker_y,
         )
 
@@ -955,9 +1197,14 @@ class Hud:
             marker_y,
         )
 
+        marker_color = tuple(
+            int(channel * 0.62)
+            for channel in CYAN
+        )
+
         pygame.draw.line(
             surface,
-            CYAN,
+            marker_color,
             (
                 int(p1[0] * k),
                 int(p1[1] * k),
@@ -966,12 +1213,12 @@ class Hud:
                 int(p2[0] * k),
                 int(p2[1] * k),
             ),
-            lw2,
+            lw,
         )
 
         pygame.draw.line(
             surface,
-            CYAN,
+            marker_color,
             (
                 int(p3[0] * k),
                 int(p3[1] * k),
@@ -980,7 +1227,7 @@ class Hud:
                 int(p4[0] * k),
                 int(p4[1] * k),
             ),
-            lw2,
+            lw,
         )
 
     # -----------------------------------------------------------------------
@@ -988,17 +1235,23 @@ class Hud:
     # -----------------------------------------------------------------------
 
     def draw(self):
-        t = time.monotonic() - self.t0
+        t = (
+            time.monotonic()
+            - self.t0
+        )
 
         imu = self.imu_state(t)
 
         if self.demo:
             gps = self.demo_gps(t)
             gps_age = None
+
         else:
             gps = self.gps.data
+
             gps_age = (
-                time.monotonic() - self.gps.t
+                time.monotonic()
+                - self.gps.t
                 if self.gps.t
                 else None
             )
@@ -1038,8 +1291,7 @@ class Hud:
         # -------------------------------------------------------------------
         # Smooth orientation.
         #
-        # Pitch and bank deliberately swapped compared to the values
-        # published by imu.py.
+        # Pitch and bank deliberately swapped compared to imu.py.
         # -------------------------------------------------------------------
 
         pitch = float(
@@ -1068,11 +1320,13 @@ class Hud:
         )
 
         self.smooth_pitch += (
-            pitch - self.smooth_pitch
+            pitch
+            - self.smooth_pitch
         ) * alpha
 
         self.smooth_bank += (
-            bank - self.smooth_bank
+            bank
+            - self.smooth_bank
         ) * alpha
 
         yaw_delta = (
@@ -1093,7 +1347,11 @@ class Hud:
         if self.debug:
             print(
                 "pitch=%.2f bank=%.2f yaw=%.2f"
-                % (sp, sb, sy),
+                % (
+                    sp,
+                    sb,
+                    sy,
+                ),
                 flush=True,
             )
 
@@ -1124,7 +1382,7 @@ class Hud:
             )
 
         # -------------------------------------------------------------------
-        # Unified attitude / heading element
+        # Unified spherical attitude element
         # -------------------------------------------------------------------
 
         self.draw_attitude_instrument(
@@ -1243,7 +1501,9 @@ class Hud:
 
         self.text(
             surface,
-            now_dt.strftime("%H:%M:%S"),
+            now_dt.strftime(
+                "%H:%M:%S"
+            ),
             CYAN,
             VW - 20,
             14,
@@ -1281,7 +1541,9 @@ class Hud:
             speed = str(
                 int(
                     round(
-                        float(gps["speed"])
+                        float(
+                            gps["speed"]
+                        )
                         * multiplier
                     )
                 )
@@ -1309,11 +1571,31 @@ class Hud:
             "la",
         )
 
+        # Position unit based on rendered width instead of assuming
+        # a fixed character width.
+        speed_font = self.font(
+            44,
+            True,
+        )
+
+        speed_surface = speed_font.render(
+            speed,
+            True,
+            AMBER,
+        )
+
+        speed_width = (
+            speed_surface.get_width()
+            / k
+        )
+
         self.text(
             surface,
             self.unit,
             AMBER,
-            20 + len(speed) * 26 + 14,
+            20
+            + speed_width
+            + 14,
             VH - 40,
             14,
             False,
@@ -1340,9 +1622,15 @@ class Hud:
                 surface,
                 "%.5f %s"
                 % (
-                    abs(float(gps["lat"])),
+                    abs(
+                        float(
+                            gps["lat"]
+                        )
+                    ),
                     "N"
-                    if float(gps["lat"]) >= 0
+                    if float(
+                        gps["lat"]
+                    ) >= 0
                     else "S",
                 ),
                 CYAN,
@@ -1357,9 +1645,15 @@ class Hud:
                 surface,
                 "%.5f %s"
                 % (
-                    abs(float(gps["lon"])),
+                    abs(
+                        float(
+                            gps["lon"]
+                        )
+                    ),
                     "E"
-                    if float(gps["lon"]) >= 0
+                    if float(
+                        gps["lon"]
+                    ) >= 0
                     else "W",
                 ),
                 CYAN,
@@ -1374,8 +1668,16 @@ class Hud:
                 surface,
                 "%d sats - hdop %s"
                 % (
-                    int(gps.get("sats", 0)),
-                    gps.get("hdop", "-"),
+                    int(
+                        gps.get(
+                            "sats",
+                            0,
+                        )
+                    ),
+                    gps.get(
+                        "hdop",
+                        "-",
+                    ),
                 ),
                 DIM,
                 VW - 20,
@@ -1419,6 +1721,10 @@ class Hud:
                 gps,
                 gps_age,
             )
+
+        # -------------------------------------------------------------------
+        # IMU disconnected indicator
+        # -------------------------------------------------------------------
 
         if not imu.get("ok"):
             self.text(
@@ -1480,8 +1786,8 @@ class Hud:
         surface.blit(
             panel,
             (
-                x * k,
-                y * k,
+                int(x * k),
+                int(y * k),
             ),
         )
 
@@ -1489,12 +1795,15 @@ class Hud:
             surface,
             DIM,
             (
-                x * k,
-                y * k,
-                w * k,
-                h * k,
+                int(x * k),
+                int(y * k),
+                int(w * k),
+                int(h * k),
             ),
-            max(2, int(1.2 * k)),
+            max(
+                2,
+                int(1.2 * k),
+            ),
             3,
         )
 
@@ -1567,7 +1876,10 @@ class Hud:
         self.text(
             surface,
             "%d hz"
-            % imu.get("hz", 0),
+            % imu.get(
+                "hz",
+                0,
+            ),
             AMBER,
             x + w - 14,
             y + 78,
@@ -1625,6 +1937,7 @@ class Hud:
 
         if self.imu is not None:
             imu = self.imu
+
         else:
             class DemoImu:
                 @staticmethod
