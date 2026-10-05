@@ -42,7 +42,6 @@ BG = (0, 0, 0)
 
 GPS_STALE_S = 6.0
 
-LADDER_DEGS = range(-180, 181, 10)
 PITCH_PX_PER_DEG = 3.0
 LADDER_MARGIN = 120.0
 
@@ -54,8 +53,25 @@ FONT_PATHS = (
 
 FONT_PATHS_BOLD = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
 )
+
+# ---------------------------------------------------------------------------
+# Heading arc configuration
+# ---------------------------------------------------------------------------
+
+# Large circular heading scale.
+HEADING_RADIUS = 155.0
+
+# Move the circle slightly downward so its apex sits just below the
+# top of the HUD.
+HEADING_CENTER_Y = 205.0
+
+# Number of individual ticks around the complete 360-degree circle.
+HEADING_TICKS = 72
+
+# The arc is clipped at the horizontal centerline.
+HEADING_CLIP_Y = CY
 
 
 def _find_font(bold=False):
@@ -231,56 +247,6 @@ def xf(x, y, bank):
         CX + dx * cos_a - dy * sin_a,
         CY + dx * sin_a + dy * cos_a,
     )
-
-
-def rotp(x, y, degrees):
-    """Rotate a HUD point around the center."""
-
-    angle = math.radians(degrees)
-
-    dx = x - CX
-    dy = y - CY
-
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-
-    return (
-        CX + dx * cos_a - dy * sin_a,
-        CY + dx * sin_a + dy * cos_a,
-    )
-
-
-def heading_ring_ticks():
-    """
-    Full 360-degree dashed circle.
-
-    The circle itself is fixed around the HUD center.
-    The dash pattern is phase-shifted by heading (yaw).
-    The renderer later clips everything below CY.
-    """
-
-    segments = []
-
-    radius = 108.0
-
-    # 72 positions around the complete circle.
-    # Every other segment is a dash.
-    for i in range(72):
-        a1 = math.radians(i * 5.0)
-        a2 = math.radians(i * 5.0 + 3.0)
-
-        segments.append(
-            (
-                radius,
-                a1,
-                a2,
-            )
-        )
-
-    return segments
-
-
-HEADING_RING = heading_ring_ticks()
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +514,160 @@ class Hud:
         }
 
     # -----------------------------------------------------------------------
+    # Heading arc
+    # -----------------------------------------------------------------------
+
+    def draw_heading_arc(
+        self,
+        surface,
+        sy,
+        k,
+        width,
+    ):
+        """
+        Draw a large circular heading scale.
+
+        The scale is a complete 360-degree ring geometrically, but
+        anything below the horizontal centerline is transparent.
+
+        Individual ticks are radial and vary in size/thickness according
+        to their position, producing a more dimensional instrument look.
+
+        sy rotates the heading scale.
+        """
+
+        for i in range(HEADING_TICKS):
+
+            # Every tick represents 5 degrees.
+            heading = (
+                i * (360.0 / HEADING_TICKS)
+                + sy
+            )
+
+            angle = math.radians(
+                heading - 90.0
+            )
+
+            # Position on the circle.
+            x = (
+                CX
+                + HEADING_RADIUS * math.cos(angle)
+            )
+
+            y = (
+                HEADING_CENTER_Y
+                + HEADING_RADIUS * math.sin(angle)
+            )
+
+            # ---------------------------------------------------------------
+            # Only the upper hemisphere is visible.
+            # ---------------------------------------------------------------
+
+            if y >= HEADING_CLIP_Y:
+                continue
+
+            # ---------------------------------------------------------------
+            # Depth / perspective.
+            #
+            # Ticks near the top-center are larger.
+            # Ticks toward the sides recede and become smaller.
+            # ---------------------------------------------------------------
+
+            # Distance from the top-center.
+            depth = math.cos(angle)
+
+            # Keep front-facing portion strongest.
+            depth = max(
+                0.0,
+                depth,
+            )
+
+            perspective = (
+                0.35
+                + depth * 0.85
+            )
+
+            tick_height = (
+                7.0
+                + 20.0 * perspective
+            )
+
+            tick_width = max(
+                1,
+                int(
+                    (
+                        0.8
+                        + 1.6 * perspective
+                    ) * k
+                ),
+            )
+
+            # ---------------------------------------------------------------
+            # Radial direction.
+            # ---------------------------------------------------------------
+
+            radial_x = math.cos(angle)
+            radial_y = math.sin(angle)
+
+            # Ticks extend inward from the circular rim.
+            x1 = x
+            y1 = y
+
+            x2 = (
+                x
+                - radial_x * tick_height
+            )
+
+            y2 = (
+                y
+                - radial_y * tick_height
+            )
+
+            # ---------------------------------------------------------------
+            # Clip the inner end if it reaches the transparent half.
+            # ---------------------------------------------------------------
+
+            if y2 > HEADING_CLIP_Y:
+                y2 = HEADING_CLIP_Y
+
+            # ---------------------------------------------------------------
+            # Slight brightness/depth variation.
+            # ---------------------------------------------------------------
+
+            brightness = (
+                0.50
+                + 0.50 * perspective
+            )
+
+            color = tuple(
+                max(
+                    0,
+                    min(
+                        255,
+                        int(
+                            channel
+                            * brightness
+                        ),
+                    ),
+                )
+                for channel in DIM
+            )
+
+            pygame.draw.line(
+                surface,
+                color,
+                (
+                    int(x1 * k),
+                    int(y1 * k),
+                ),
+                (
+                    int(x2 * k),
+                    int(y2 * k),
+                ),
+                tick_width,
+            )
+
+    # -----------------------------------------------------------------------
     # Drawing
     # -----------------------------------------------------------------------
 
@@ -714,15 +834,19 @@ class Hud:
             ):
                 continue
 
-            visual_distance = abs(y - CY)
+            visual_distance = abs(
+                y - CY
+            )
 
             max_distance = (
-                90.0 * PITCH_PX_PER_DEG
+                90.0
+                * PITCH_PX_PER_DEG
             )
 
             rung_distance = min(
                 1.0,
-                visual_distance / max_distance,
+                visual_distance
+                / max_distance,
             )
 
             if rung_distance <= 0.5:
@@ -770,7 +894,8 @@ class Hud:
                     min(
                         255,
                         int(
-                            channel * brightness
+                            channel
+                            * brightness
                         ),
                     ),
                 )
@@ -847,58 +972,18 @@ class Hud:
         )
 
         # -------------------------------------------------------------------
-        # Heading ring
+        # NEW HEADING ARC
         #
-        # Full 360-degree dashed circle, but only the upper 180 degrees
-        # are visible. Yaw rotates the dash pattern around the circle.
+        # Replaces the old gray bank ticks + orange triangle,
+        # center crosshair, and orange heading arrow.
         # -------------------------------------------------------------------
 
-        ring_radius = 108.0
-
-        # Heading moves the dash pattern around the ring.
-        heading_phase = sy
-
-        for radius, a1, a2 in HEADING_RING:
-
-            # Apply yaw to the dash position.
-            start = a1 + math.radians(heading_phase)
-            end = a2 + math.radians(heading_phase)
-
-            # Draw each dash as a short line on the circular path.
-            x1 = CX + ring_radius * math.cos(start)
-            y1 = CY + ring_radius * math.sin(start)
-
-            x2 = CX + ring_radius * math.cos(end)
-            y2 = CY + ring_radius * math.sin(end)
-
-            # Clip anything below the horizontal centerline.
-            #
-            # This makes the lower 180 degrees completely transparent.
-            if y1 > CY and y2 > CY:
-                continue
-
-            # If a dash crosses the centerline, clip its lower endpoint.
-            if y1 > CY:
-                y1 = CY
-
-            if y2 > CY:
-                y2 = CY
-
-            pygame.draw.line(
-                surface,
-                DIM,
-                (
-                    int(x1 * k),
-                    int(y1 * k),
-                ),
-                (
-                    int(x2 * k),
-                    int(y2 * k),
-                ),
-                lw,
-            )
-
-
+        self.draw_heading_arc(
+            surface,
+            sy,
+            k,
+            lw,
+        )
 
         # -------------------------------------------------------------------
         # Corner brackets
@@ -1050,7 +1135,6 @@ class Hud:
                 )
             )
 
-        # Label moved above the speed reading.
         self.text(
             surface,
             "ground speed",
@@ -1089,7 +1173,6 @@ class Hud:
         # -------------------------------------------------------------------
 
         if gps:
-            # GPS label moved above the coordinate/readout block.
             self.text(
                 surface,
                 "gps",
@@ -1175,9 +1258,6 @@ class Hud:
 
         # -------------------------------------------------------------------
         # Menu
-        #
-        # M key still toggles this menu.
-        # The on-screen menu button has been removed.
         # -------------------------------------------------------------------
 
         if self.menu:
