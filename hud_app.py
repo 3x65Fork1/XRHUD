@@ -437,55 +437,31 @@ class Hud:
         """
         Return a real antialiased TrueType font.
 
-        Fonts are rendered at the high-resolution backing surface size,
-        then the complete HUD is scaled to the display.  This avoids the
-        blocky appearance produced by pygame's default bitmap font.
+        Render fonts at logical HUD resolution. The entire HUD is then
+        scaled to the display.
         """
 
-        px = max(
-            10,
-            int(
-                logical_px
-                * self.k
-                * 0.72
-            ),
-        )
+        px = max(8, int(logical_px * self.k))
 
-        key = (
-            px,
-            bool(bold),
-        )
+        key = (px, bool(bold))
 
         if key in self.fonts:
             return self.fonts[key]
 
         path = _find_font(bold)
 
-        try:
-            if path:
-                font = pygame.font.Font(
-                    path,
-                    px,
-                )
-            else:
-                # SysFont still gives us a scalable TrueType font when
-                # available, unlike pygame.font.Font(None, ...).
-                font = pygame.font.SysFont(
-                    "DejaVu Sans",
-                    px,
-                    bold=bool(bold),
-                )
-
-        except Exception:
+        if path:
+            font = pygame.font.Font(path, px)
+        else:
             font = pygame.font.SysFont(
-                "sans",
+                "dejavusans",
                 px,
                 bold=bool(bold),
             )
 
         self.fonts[key] = font
-
         return font
+
 
     def text(
         self,
@@ -499,21 +475,10 @@ class Hud:
         anchor="la",
     ):
         """
-        Draw antialiased HUD text.
-
-        Supported horizontal anchors:
-            la = left
-            ca = center
-            ra = right
-
-        The vertical component remains top-aligned, matching the original
-        HUD layout.
+        Render antialiased TrueType text onto the HUD.
         """
 
-        font = self.font(
-            size,
-            bold,
-        )
+        font = self.font(size, bold)
 
         rendered = font.render(
             str(txt),
@@ -521,44 +486,26 @@ class Hud:
             color,
         )
 
+        # IMPORTANT:
+        # Do not manipulate the font surface's pixel format.
+        # pygame handles the alpha channel correctly when blitting
+        # an antialiased font surface onto an SRCALPHA surface.
+
         rect = rendered.get_rect()
 
-        px = int(
-            round(x * self.k)
-        )
+        px = int(round(x * self.k))
+        py = int(round(y * self.k))
 
-        py = int(
-            round(y * self.k)
-        )
+        if anchor == "ra":
+            rect.topright = (px, py)
 
-        horizontal = (
-            anchor[0]
-            if anchor
-            else "l"
-        )
-
-        if horizontal == "r":
-            rect.topright = (
-                px,
-                py,
-            )
-
-        elif horizontal == "c":
-            rect.midtop = (
-                px,
-                py,
-            )
+        elif anchor == "ca":
+            rect.midtop = (px, py)
 
         else:
-            rect.topleft = (
-                px,
-                py,
-            )
+            rect.topleft = (px, py)
 
-        surface.blit(
-            rendered,
-            rect,
-        )
+        surface.blit(rendered, rect)
 
     # -----------------------------------------------------------------------
     # Input
