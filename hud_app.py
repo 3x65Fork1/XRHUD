@@ -250,36 +250,37 @@ def rotp(x, y, degrees):
     )
 
 
-def bank_ticks():
+def heading_ring_ticks():
+    """
+    Full 360-degree dashed circle.
+
+    The circle itself is fixed around the HUD center.
+    The dash pattern is phase-shifted by heading (yaw).
+    The renderer later clips everything below CY.
+    """
+
     segments = []
 
-    for bank in range(-60, 61, 10):
-        angle = math.radians(270 + bank)
+    radius = 108.0
 
-        r1 = 102.0
-
-        if bank % 30 == 0:
-            r2 = 118.0
-        else:
-            r2 = 109.0
+    # 72 positions around the complete circle.
+    # Every other segment is a dash.
+    for i in range(72):
+        a1 = math.radians(i * 5.0)
+        a2 = math.radians(i * 5.0 + 3.0)
 
         segments.append(
             (
-                (
-                    CX + r1 * math.cos(angle),
-                    CY + r1 * math.sin(angle),
-                ),
-                (
-                    CX + r2 * math.cos(angle),
-                    CY + r2 * math.sin(angle),
-                ),
+                radius,
+                a1,
+                a2,
             )
         )
 
     return segments
 
 
-BANK_TICKS = bank_ticks()
+HEADING_RING = heading_ring_ticks()
 
 
 # ---------------------------------------------------------------------------
@@ -846,124 +847,58 @@ class Hud:
         )
 
         # -------------------------------------------------------------------
-        # Bank scale
+        # Heading ring
+        #
+        # Full 360-degree dashed circle, but only the upper 180 degrees
+        # are visible. Yaw rotates the dash pattern around the circle.
         # -------------------------------------------------------------------
 
-        for p1, p2 in BANK_TICKS:
-            line(
-                p1[0],
-                p1[1],
-                p2[0],
-                p2[1],
+        ring_radius = 108.0
+
+        # Heading moves the dash pattern around the ring.
+        heading_phase = sy
+
+        for radius, a1, a2 in HEADING_RING:
+
+            # Apply yaw to the dash position.
+            start = a1 + math.radians(heading_phase)
+            end = a2 + math.radians(heading_phase)
+
+            # Draw each dash as a short line on the circular path.
+            x1 = CX + ring_radius * math.cos(start)
+            y1 = CY + ring_radius * math.sin(start)
+
+            x2 = CX + ring_radius * math.cos(end)
+            y2 = CY + ring_radius * math.sin(end)
+
+            # Clip anything below the horizontal centerline.
+            #
+            # This makes the lower 180 degrees completely transparent.
+            if y1 > CY and y2 > CY:
+                continue
+
+            # If a dash crosses the centerline, clip its lower endpoint.
+            if y1 > CY:
+                y1 = CY
+
+            if y2 > CY:
+                y2 = CY
+
+            pygame.draw.line(
+                surface,
                 DIM,
+                (
+                    int(x1 * k),
+                    int(y1 * k),
+                ),
+                (
+                    int(x2 * k),
+                    int(y2 * k),
+                ),
                 lw,
             )
 
-        triangle = [
-            rotp(
-                320,
-                62,
-                sb,
-            ),
-            rotp(
-                312,
-                77,
-                sb,
-            ),
-            rotp(
-                328,
-                77,
-                sb,
-            ),
-        ]
 
-        pygame.draw.polygon(
-            surface,
-            AMBER,
-            [
-                (
-                    x * k,
-                    y * k,
-                )
-                for x, y in triangle
-            ],
-        )
-
-        # -------------------------------------------------------------------
-        # Center crosshair
-        # -------------------------------------------------------------------
-
-        pygame.draw.circle(
-            surface,
-            AMBER,
-            (
-                int(CX * k),
-                int(CY * k),
-            ),
-            int(28 * k),
-            lw2,
-        )
-
-        line(
-            CX,
-            CY - 28,
-            CX,
-            CY - 14,
-            AMBER,
-            lw2,
-        )
-
-        line(
-            CX,
-            CY + 14,
-            CX,
-            CY + 28,
-            AMBER,
-            lw2,
-        )
-
-        pygame.draw.circle(
-            surface,
-            AMBER,
-            (
-                int(CX * k),
-                int(CY * k),
-            ),
-            int(2.4 * k),
-        )
-
-        # -------------------------------------------------------------------
-        # Heading arrow
-        # -------------------------------------------------------------------
-
-        angle = math.radians(sy)
-
-        arrow = [
-            (
-                CX + 46 * math.sin(angle),
-                CY - 46 * math.cos(angle),
-            ),
-            (
-                CX + 36 * math.sin(angle - 0.18),
-                CY - 36 * math.cos(angle - 0.18),
-            ),
-            (
-                CX + 36 * math.sin(angle + 0.18),
-                CY - 36 * math.cos(angle + 0.18),
-            ),
-        ]
-
-        pygame.draw.polygon(
-            surface,
-            AMBER,
-            [
-                (
-                    x * k,
-                    y * k,
-                )
-                for x, y in arrow
-            ],
-        )
 
         # -------------------------------------------------------------------
         # Corner brackets
