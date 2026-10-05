@@ -57,21 +57,28 @@ FONT_PATHS_BOLD = (
 )
 
 # ---------------------------------------------------------------------------
-# Heading arc configuration
+# Unified attitude / heading instrument
 # ---------------------------------------------------------------------------
 
-# Large circular heading scale.
-HEADING_RADIUS = 155.0
+# The entire attitude instrument is biased upward.
+# The center of the display remains comparatively open.
+ATTITUDE_CENTER_X = CX
+ATTITUDE_CENTER_Y = 122.0
 
-# Move the circle slightly downward so its apex sits just below the
-# top of the HUD.
-HEADING_CENTER_Y = 205.0
+# Heading ring.
+ATTITUDE_RADIUS = 132.0
 
-# Number of individual ticks around the complete 360-degree circle.
+# Number of heading ticks around the full circle.
 HEADING_TICKS = 72
 
-# The arc is clipped at the horizontal centerline.
-HEADING_CLIP_Y = CY
+# Only the upper portion of the spherical instrument is visible.
+ATTITUDE_CLIP_Y = 182.0
+
+# Width of the pitch surface.
+ATTITUDE_HALF_WIDTH = 108.0
+
+# Perspective amount applied to the pitch ladder.
+ATTITUDE_PERSPECTIVE = 0.32
 
 
 def _find_font(bold=False):
@@ -514,129 +521,185 @@ class Hud:
         }
 
     # -----------------------------------------------------------------------
-    # Heading arc
+    # Unified attitude / heading instrument
     # -----------------------------------------------------------------------
 
-    def draw_heading_arc(
+    def draw_attitude_instrument(
         self,
         surface,
-        sy,
+        pitch,
+        bank,
+        yaw,
         k,
-        width,
+        lw,
+        lw2,
     ):
         """
-        Draw a large circular heading scale.
+        Draw the heading scale and pitch ladder as one unified,
+        three-dimensional attitude reference.
 
-        The scale is a complete 360-degree ring geometrically, but
-        anything below the horizontal centerline is transparent.
+        The heading scale forms the outer spherical rim.
 
-        Individual ticks are radial and vary in size/thickness according
-        to their position, producing a more dimensional instrument look.
-
-        sy rotates the heading scale.
+        The pitch ladder is projected onto that same implied surface,
+        rather than behaving like an independent flat ladder.
         """
+
+        # -------------------------------------------------------------------
+        # Shared instrument transform
+        # -------------------------------------------------------------------
+
+        center_x = ATTITUDE_CENTER_X
+        center_y = ATTITUDE_CENTER_Y
+        radius = ATTITUDE_RADIUS
+
+        # Bank rotates the entire attitude surface.
+        bank_r = math.radians(-bank)
+
+        cos_b = math.cos(bank_r)
+        sin_b = math.sin(bank_r)
+
+        def rotate_point(x, y):
+            dx = x - center_x
+            dy = y - center_y
+
+            return (
+                center_x
+                + dx * cos_b
+                - dy * sin_b,
+                center_y
+                + dx * sin_b
+                + dy * cos_b,
+            )
+
+        # -------------------------------------------------------------------
+        # Heading rim
+        # -------------------------------------------------------------------
+
+        # Yaw shifts the heading positions around the same sphere.
+        heading_step = 360.0 / HEADING_TICKS
 
         for i in range(HEADING_TICKS):
 
-            # Every tick represents 5 degrees.
             heading = (
-                i * (360.0 / HEADING_TICKS)
-                + sy
+                i * heading_step
+                + yaw
             )
 
             angle = math.radians(
                 heading - 90.0
             )
 
-            # Position on the circle.
-            x = (
-                CX
-                + HEADING_RADIUS * math.cos(angle)
+            # Circular base position.
+            local_x = (
+                center_x
+                + radius * math.cos(angle)
             )
 
-            y = (
-                HEADING_CENTER_Y
-                + HEADING_RADIUS * math.sin(angle)
+            local_y = (
+                center_y
+                + radius * math.sin(angle)
             )
 
-            # ---------------------------------------------------------------
-            # Only the upper hemisphere is visible.
-            # ---------------------------------------------------------------
-
-            if y >= HEADING_CLIP_Y:
+            # The circle is the outer boundary of the virtual sphere.
+            #
+            # Keep only the forward/upper portion.
+            if local_y >= ATTITUDE_CLIP_Y:
                 continue
 
             # ---------------------------------------------------------------
-            # Depth / perspective.
+            # Depth.
             #
-            # Ticks near the top-center are larger.
-            # Ticks toward the sides recede and become smaller.
+            # The top-center is closest to the viewer.
+            # The sides fall away into depth.
             # ---------------------------------------------------------------
 
-            # Distance from the top-center.
-            depth = math.cos(angle)
-
-            # Keep front-facing portion strongest.
-            depth = max(
+            front = max(
                 0.0,
-                depth,
+                math.cos(angle),
             )
 
-            perspective = (
-                0.35
-                + depth * 0.85
+            depth = (
+                0.30
+                + front * 0.70
             )
 
-            tick_height = (
-                7.0
-                + 20.0 * perspective
+            # Major ticks every 15 degrees.
+            major = (
+                i % 3 == 0
+            )
+
+            # Cardinal ticks every 45 degrees.
+            cardinal = (
+                i % 9 == 0
+            )
+
+            if cardinal:
+                tick_height = 18.0
+                base_width = 2.4
+
+            elif major:
+                tick_height = 13.0
+                base_width = 1.8
+
+            else:
+                tick_height = 7.0
+                base_width = 1.1
+
+            tick_height *= (
+                0.65
+                + depth * 0.65
             )
 
             tick_width = max(
                 1,
                 int(
-                    (
-                        0.8
-                        + 1.6 * perspective
-                    ) * k
+                    base_width
+                    * (
+                        0.65
+                        + depth * 0.55
+                    )
+                    * k
                 ),
             )
 
-            # ---------------------------------------------------------------
             # Radial direction.
-            # ---------------------------------------------------------------
-
             radial_x = math.cos(angle)
             radial_y = math.sin(angle)
 
-            # Ticks extend inward from the circular rim.
-            x1 = x
-            y1 = y
+            outer_x = local_x
+            outer_y = local_y
 
-            x2 = (
-                x
+            inner_x = (
+                local_x
                 - radial_x * tick_height
             )
 
-            y2 = (
-                y
+            inner_y = (
+                local_y
                 - radial_y * tick_height
             )
 
-            # ---------------------------------------------------------------
-            # Clip the inner end if it reaches the transparent half.
-            # ---------------------------------------------------------------
+            # Rotate the whole spherical reference with bank.
+            x1, y1 = rotate_point(
+                outer_x,
+                outer_y,
+            )
 
-            if y2 > HEADING_CLIP_Y:
-                y2 = HEADING_CLIP_Y
+            x2, y2 = rotate_point(
+                inner_x,
+                inner_y,
+            )
 
-            # ---------------------------------------------------------------
-            # Slight brightness/depth variation.
-            # ---------------------------------------------------------------
+            # Clip below the visible horizon.
+            if (
+                y1 >= ATTITUDE_CLIP_Y
+                and y2 >= ATTITUDE_CLIP_Y
+            ):
+                continue
 
             brightness = (
-                0.50
-                + 0.50 * perspective
+                0.40
+                + depth * 0.60
             )
 
             color = tuple(
@@ -666,6 +729,259 @@ class Hud:
                 ),
                 tick_width,
             )
+
+        # -------------------------------------------------------------------
+        # Pitch ladder
+        # -------------------------------------------------------------------
+
+        # The pitch ladder is projected onto the same circular surface.
+        #
+        # Positive pitch moves the attitude surface downward, matching
+        # the existing attitude convention.
+        pitch_offset = (
+            pitch * PITCH_PX_PER_DEG
+        )
+
+        for degrees in range(
+            -90,
+            91,
+            10,
+        ):
+
+            # Vertical position on the shared spherical surface.
+            local_y = (
+                center_y
+                - degrees * PITCH_PX_PER_DEG
+                + pitch_offset
+            )
+
+            # Distance from the center of the sphere.
+            vertical = (
+                local_y
+                - center_y
+            )
+
+            normalized = (
+                vertical / radius
+            )
+
+            # Outside the spherical surface.
+            if abs(normalized) > 1.0:
+                continue
+
+            # Spherical cross-section.
+            sphere_width = math.sqrt(
+                max(
+                    0.0,
+                    1.0 - normalized * normalized,
+                )
+            )
+
+            # Perspective deliberately compresses the outer portions.
+            perspective = (
+                1.0
+                - ATTITUDE_PERSPECTIVE
+                * abs(normalized)
+            )
+
+            half_width = (
+                ATTITUDE_HALF_WIDTH
+                * sphere_width
+                * perspective
+            )
+
+            # Keep the center section stronger.
+            if degrees == 0:
+                half_width *= 1.08
+
+            # Pitch lines become slightly more dimensional toward the
+            # center/front of the virtual sphere.
+            depth = (
+                1.0
+                - abs(normalized)
+            )
+
+            brightness = (
+                0.48
+                + 0.52 * depth
+            )
+
+            if degrees == 0:
+                base_color = CYAN
+                line_width = lw2
+
+            elif abs(degrees) <= 30:
+                base_color = AMBER
+                line_width = lw
+
+            else:
+                base_color = RED
+                line_width = lw
+
+            color = tuple(
+                max(
+                    0,
+                    min(
+                        255,
+                        int(
+                            channel
+                            * brightness
+                        ),
+                    ),
+                )
+                for channel in base_color
+            )
+
+            # ---------------------------------------------------------------
+            # Main projected pitch line.
+            # ---------------------------------------------------------------
+
+            x1 = (
+                center_x
+                - half_width
+            )
+
+            x2 = (
+                center_x
+                + half_width
+            )
+
+            y = local_y
+
+            p1 = rotate_point(
+                x1,
+                y,
+            )
+
+            p2 = rotate_point(
+                x2,
+                y,
+            )
+
+            # Don't allow the attitude element to invade the lower
+            # sightline.
+            if (
+                p1[1] > ATTITUDE_CLIP_Y
+                and p2[1] > ATTITUDE_CLIP_Y
+            ):
+                continue
+
+            pygame.draw.line(
+                surface,
+                color,
+                (
+                    int(p1[0] * k),
+                    int(p1[1] * k),
+                ),
+                (
+                    int(p2[0] * k),
+                    int(p2[1] * k),
+                ),
+                line_width,
+            )
+
+            # ---------------------------------------------------------------
+            # Short inner line.
+            #
+            # This gives the ladder a layered / dimensional appearance
+            # without introducing a separate visual element.
+            # ---------------------------------------------------------------
+
+            inner_half = (
+                half_width
+                * 0.34
+            )
+
+            inner_color = tuple(
+                int(channel * 0.55)
+                for channel in color
+            )
+
+            ip1 = rotate_point(
+                center_x - inner_half,
+                y,
+            )
+
+            ip2 = rotate_point(
+                center_x + inner_half,
+                y,
+            )
+
+            pygame.draw.line(
+                surface,
+                inner_color,
+                (
+                    int(ip1[0] * k),
+                    int(ip1[1] * k),
+                ),
+                (
+                    int(ip2[0] * k),
+                    int(ip2[1] * k),
+                ),
+                max(
+                    1,
+                    lw,
+                ),
+            )
+
+        # -------------------------------------------------------------------
+        # Central attitude reference.
+        #
+        # This is deliberately very small and sits above the actual
+        # sightline so the center remains open.
+        # -------------------------------------------------------------------
+
+        marker_y = center_y + 38.0
+
+        marker_half = 15.0
+
+        p1 = rotate_point(
+            center_x - marker_half,
+            marker_y,
+        )
+
+        p2 = rotate_point(
+            center_x - 4.0,
+            marker_y,
+        )
+
+        p3 = rotate_point(
+            center_x + 4.0,
+            marker_y,
+        )
+
+        p4 = rotate_point(
+            center_x + marker_half,
+            marker_y,
+        )
+
+        pygame.draw.line(
+            surface,
+            CYAN,
+            (
+                int(p1[0] * k),
+                int(p1[1] * k),
+            ),
+            (
+                int(p2[0] * k),
+                int(p2[1] * k),
+            ),
+            lw2,
+        )
+
+        pygame.draw.line(
+            surface,
+            CYAN,
+            (
+                int(p3[0] * k),
+                int(p3[1] * k),
+            ),
+            (
+                int(p4[0] * k),
+                int(p4[1] * k),
+            ),
+            lw2,
+        )
 
     # -----------------------------------------------------------------------
     # Drawing
@@ -808,181 +1124,17 @@ class Hud:
             )
 
         # -------------------------------------------------------------------
-        # Attitude ladder
+        # Unified attitude / heading element
         # -------------------------------------------------------------------
 
-        ladder_surface = pygame.Surface(
-            (
-                int(VW * k),
-                int(VH * k),
-            )
-        )
-
-        ladder_surface.fill(BG)
-
-        for degrees in range(-90, 91, 10):
-
-            y = (
-                CY
-                - degrees * PITCH_PX_PER_DEG
-                + sp * PITCH_PX_PER_DEG
-            )
-
-            if (
-                y < -LADDER_MARGIN
-                or y > VH + LADDER_MARGIN
-            ):
-                continue
-
-            visual_distance = abs(
-                y - CY
-            )
-
-            max_distance = (
-                90.0
-                * PITCH_PX_PER_DEG
-            )
-
-            rung_distance = min(
-                1.0,
-                visual_distance
-                / max_distance,
-            )
-
-            if rung_distance <= 0.5:
-
-                color_t = (
-                    rung_distance / 0.5
-                )
-
-                rgb = tuple(
-                    int(
-                        CYAN[i]
-                        + (
-                            AMBER[i]
-                            - CYAN[i]
-                        ) * color_t
-                    )
-                    for i in range(3)
-                )
-
-            else:
-
-                color_t = (
-                    rung_distance - 0.5
-                ) / 0.5
-
-                rgb = tuple(
-                    int(
-                        AMBER[i]
-                        + (
-                            RED[i]
-                            - AMBER[i]
-                        ) * color_t
-                    )
-                    for i in range(3)
-                )
-
-            brightness = (
-                1.0
-                - 0.75 * rung_distance
-            )
-
-            color = tuple(
-                max(
-                    0,
-                    min(
-                        255,
-                        int(
-                            channel
-                            * brightness
-                        ),
-                    ),
-                )
-                for channel in rgb
-            )
-
-            if degrees == 0:
-                half = 110
-                line_width = lw2
-            else:
-                half = 92
-                line_width = lw
-
-            x1, y1 = xf(
-                CX - half,
-                y,
-                sb,
-            )
-
-            x2, y2 = xf(
-                CX + half,
-                y,
-                sb,
-            )
-
-            pygame.draw.line(
-                ladder_surface,
-                color,
-                (
-                    int(x1 * k),
-                    int(y1 * k),
-                ),
-                (
-                    int(x2 * k),
-                    int(y2 * k),
-                ),
-                line_width,
-            )
-
-            inner_color = tuple(
-                int(channel * 0.65)
-                for channel in color
-            )
-
-            ix1, iy1 = xf(
-                CX - 32,
-                y,
-                sb,
-            )
-
-            ix2, iy2 = xf(
-                CX + 32,
-                y,
-                sb,
-            )
-
-            pygame.draw.line(
-                ladder_surface,
-                inner_color,
-                (
-                    int(ix1 * k),
-                    int(iy1 * k),
-                ),
-                (
-                    int(ix2 * k),
-                    int(iy2 * k),
-                ),
-                lw,
-            )
-
-        surface.blit(
-            ladder_surface,
-            (0, 0),
-        )
-
-        # -------------------------------------------------------------------
-        # NEW HEADING ARC
-        #
-        # Replaces the old gray bank ticks + orange triangle,
-        # center crosshair, and orange heading arrow.
-        # -------------------------------------------------------------------
-
-        self.draw_heading_arc(
+        self.draw_attitude_instrument(
             surface,
+            sp,
+            sb,
             sy,
             k,
             lw,
+            lw2,
         )
 
         # -------------------------------------------------------------------
