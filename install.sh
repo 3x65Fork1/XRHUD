@@ -1,52 +1,126 @@
 #!/usr/bin/env bash
 # xreal-hud one-time setup for CachyOS/Steam Deck.
-# No pip, no venv, no PyInstaller (AUR-only on Arch and unnecessary here).
-# Note on hid bindings: Arch has TWO packages providing the 'hid' python
-# module - python-hidapi and python-hid - and they conflict with each other.
-# This script does not care which you have: it installs python-hidapi only
-# if NO 'hid' module is importable. Safe to re-run.
+#
+# No pip, no venv, no PyInstaller.
+#
+# Runtime structure:
+#
+#   main.py       -> application entrypoint
+#   hud.py        -> HUD/rendering
+#   text.py       -> text rendering
+#   menu.py       -> menu/UI
+#   attitude.py   -> attitude/orientation presentation
+#   gps.py        -> GPS handling
+#   imulogic.py   -> IMU lifecycle/reconnect logic
+#   imu.py        -> low-level Xreal IMU/HID reader
+#
+# imu.py and imulogic.py are both installed because:
+#   imulogic.py imports ImuReader from imu.py.
+#
+# Arch has TWO packages providing the Python 'hid' module:
+#   python-hidapi
+#   python-hid
+#
+# They conflict with each other.
+# This script only installs python-hidapi if no usable 'hid'
+# Python module is currently importable.
+
 set -euo pipefail
+
 cd "$(dirname "$0")"
 
 DEST="$HOME/.local/share/xreal-hud"
 
 echo "== 1/3 system packages (pacman) =="
+
 need=()
-pacman -Q python-pygame >/dev/null 2>&1 || need+=(python-pygame)
-python3 -c "import hid" 2>/dev/null || need+=(python-hidapi hidapi)
+
+# pygame is required by the HUD.
+if ! pacman -Q python-pygame >/dev/null 2>&1; then
+    need+=(python-pygame)
+fi
+
+# Only install python-hidapi if Python cannot currently import hid.
+if ! python3 -c "import hid" >/dev/null 2>&1; then
+    need+=(python-hidapi hidapi)
+fi
+
 if ((${#need[@]})); then
-  echo "installing: ${need[*]}"
-  sudo pacman -S --needed --noconfirm "${need[@]}"
+    echo "installing: ${need[*]}"
+    sudo pacman -S --needed --noconfirm "${need[@]}"
 fi
 
 echo "== 2/3 install app to $DEST =="
+
+# Verify Python dependencies before installing the application.
 python3 - <<'PYEOF'
-import importlib, sys
-for m in ("pygame", "hid"):
+import importlib
+import sys
+
+for module in ("pygame", "hid"):
     try:
-        importlib.import_module(m)
+        importlib.import_module(module)
     except ImportError:
-        sys.exit(f"missing python module: {m} - install python-pygame and python-hidapi (or python-hid)")
+        sys.exit(
+            f"missing Python module: {module} - "
+            "install python-pygame and python-hidapi "
+            "(or python-hid)"
+        )
 PYEOF
+
 mkdir -p "$DEST"
-cp hud_app.py imu.py "$DEST/"
+
+# Install the actual application components.
+#
+# hud_app.py is intentionally NOT installed.
+cp \
+    main.py \
+    hud.py \
+    text.py \
+    menu.py \
+    attitude.py \
+    gps.py \
+    imu.py \
+    imulogic.py \
+    "$DEST/"
+
+# Create the executable launcher.
 cat > "$DEST/xreal-hud" <<'LAUNCHEOF'
 #!/usr/bin/env bash
+
 cd "$HOME/.local/share/xreal-hud"
-exec python3 hud_app.py "$@"
+
+exec python3 main.py "$@"
 LAUNCHEOF
+
 chmod +x "$DEST/xreal-hud"
 
 echo "== 3/3 udev rule (glasses IMU access) =="
+
 sudo cp 50-xreal-hud.rules /etc/udev/rules.d/
+
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
 echo
-echo "done. Quick check (Ctrl-C to exit):"
-echo "  $DEST/xreal-hud --demo"
+echo "========================================"
+echo "xreal-hud installation complete."
+echo "========================================"
+echo
+echo "Quick test:"
+echo
+echo "  $DEST/xreal-hud"
 echo
 echo "Then add to Steam (desktop mode):"
-echo "  Games -> Add a Non-Steam Game -> Browse -> $DEST/xreal-hud"
-echo "(if the picker hides it, switch the file dialog to 'All Files')"
+echo
+echo "  Games -> Add a Non-Steam Game -> Browse"
+echo
+echo "Select:"
+echo
+echo "  $DEST/xreal-hud"
+echo
+echo "If the file picker hides it, switch the dialog"
+echo "to 'All Files'."
+echo
 echo "Replug the glasses once so the udev rule applies."
+echo
